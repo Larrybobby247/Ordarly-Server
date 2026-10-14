@@ -221,3 +221,12 @@ export const RestaurantMessage = mongoose.model('RestaurantMessage', new Schema(
   status: { type: String, enum: ['new', 'read', 'replied', 'closed'], default: 'new', index: true },
   replies: [{ _id: false, by: String, at: Date, message: String }],
 }, { timestamps: true }));
+
+// Browser push subscriptions (one per device/browser) so restaurant owners get device notifications.
+export const PushSubscription = mongoose.model('PushSubscription', new Schema({
+  user: oid('User', { required: true, index: true }),
+  restaurant: oid('Restaurant', { required: true, index: true }),
+  endpoint: { type: String, required: true, unique: true },
+  keys: { p256dh: String, auth: String },
+  userAgent: String,
+}, { timestamps: true }));

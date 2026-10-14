@@ -1,10 +1,11 @@
 import { Router } from 'express';
-import { Order, PaymentProof } from '../models/index.js';
+import { Order, OrderPayment, PaymentProof } from '../models/index.js';
 import { readProof, sniffImage } from '../services/storage.js';
 import { z, validate, wrap, escapeHtml, naira } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant, requirePro } from '../middleware/auth.js';
-import { ORDER_TRANSITIONS } from '../config/plans.js';
+import { ORDER_TRANSITIONS, needsPaymentFirst, ACTIONABLE } from '../config/plans.js';
 import { sendEmail } from '../services/email.js';
+import { verifyOrderPayment } from '../services/orderPayments.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant);
@@ -25,6 +26,19 @@ r.get('/', wrap(async (req, res) => {
   res.json({ orders, total, page: Number(page), pages: Math.ceil(total / limit) });
 }));
 
+// Today's counts by status (Lagos day) for the Orders page tiles, plus what still needs attention overall.
+r.get('/summary', wrap(async (req, res) => {
+  const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' });
+  const start = new Date(`${day}T00:00:00+01:00`);
+  const rid = req.restaurant._id;
+  const [today, waiting] = await Promise.all([
+    Order.aggregate([{ $match: { restaurant: rid, createdAt: { $gte: start } } }, { $group: { _id: '$status', n: { $sum: 1 } } }]),
+    Order.countDocuments({ restaurant: rid, status: { $in: ['pending', 'awaiting_whatsapp'] }, ...ACTIONABLE }),
+  ]);
+  const by = Object.fromEntries(today.map((x) => [x._id, x.n]));
+  res.json({ day, byStatus: by, total: today.reduce((s, x) => s + x.n, 0), waiting });
+}));
+
 r.get('/:id', wrap(async (req, res) => {
   const o = await Order.findOne({ _id: req.params.id, restaurant: req.restaurant._id }).select('-trackingTokenHash').lean();
   o ? res.json(o) : res.status(404).json({ error: 'Not found' });
@@ -37,6 +51,8 @@ r.patch('/:id/status', validate(z.object({ status: z.string() })), wrap(async (r
   if (!o) return res.status(404).json({ error: 'Not found' });
   const next = req.body.status;
   if (!(ORDER_TRANSITIONS[o.status] || []).includes(next)) return res.status(400).json({ error: `Cannot move from ${o.status} to ${next}` });
+  // Money first: an online or bank-transfer order cannot be accepted (or moved on) until the payment is confirmed as successful.
+  if (next !== 'cancelled' && needsPaymentFirst(o)) return res.status(409).json({ error: o.paymentMethod === 'bank_transfer' ? 'Payment has not been confirmed yet. Review the customer\'s transfer proof first.' : 'Payment has not been confirmed yet. You can accept this order once Paystack confirms the payment.' });
   if (o.channel === 'whatsapp' && ['out_for_delivery'].includes(next)) return res.status(402).json({ error: 'Not available for WhatsApp orders' });
   push(o, String(req.user._id), 'status', o.status, next);
   o.status = next; await o.save();
@@ -44,6 +60,15 @@ r.patch('/:id/status', validate(z.object({ status: z.string() })), wrap(async (r
     sendEmail({ to: o.customerEmail, type: 'order_status', restaurant: o.restaurant, order: o._id, dedupeKey: `status:${o._id}:${next}`,
       subject: `Order ${o.reference}: ${next.replace(/_/g, ' ')}`, body: `<p>Your order is now <b>${escapeHtml(next.replace(/_/g, ' '))}</b>.</p>` });
   res.json(o);
+}));
+
+// Ask Paystack right now whether this order's payment went through (useful if the webhook is slow or not set up).
+r.post('/:id/recheck-payment', wrap(async (req, res) => {
+  const o = await Order.findOne({ _id: req.params.id, restaurant: req.restaurant._id, paymentMethod: 'paystack' });
+  if (!o) return res.status(404).json({ error: 'Not found' });
+  const payments = await OrderPayment.find({ order: o._id }).sort('-createdAt').limit(3);
+  for (const p of payments) { const v = await verifyOrderPayment(p); if (v.status === 'success') break; }
+  res.json(await Order.findById(o._id).select('-trackingTokenHash -idempotencyKey').lean());
 }));
 
 // Pay-on-delivery collected (Pro). Never auto-set by order status.

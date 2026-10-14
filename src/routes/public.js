@@ -5,6 +5,8 @@ import { z, validate, wrap, orderRef, randomToken, sha256, normalisePhone, naira
 import { autocomplete, quoteDelivery, validPlaceId, placesConfigured } from '../services/places.js';
 import { isProActive } from '../services/subscription.js';
 import { sendEmail, btn } from '../services/email.js';
+import { startOrderPayment } from '../services/orderPayments.js';
+import { notifyRestaurant } from '../services/notify.js';
 
 const r = Router();
 
@@ -63,7 +65,7 @@ async function publicPayload(found) {
         pickupInstructions: rest.fulfillment.pickupInstructions,
         askTableNumber: rest.fulfillment.askTableNumber,
       },
-      deliveryRules: deliveryOn ? { baseFee: f.radius.baseFee, baseDistanceKm: f.radius.baseDistanceKm, perKmRate: f.radius.perKmRate, maxRadiusKm: f.radius.maxRadiusKm, origin: f.location?.lat != null ? { lat: f.location.lat, lng: f.location.lng } : null } : null,
+      deliveryRules: deliveryOn ? { baseFee: f.radius.baseFee, baseDistanceKm: f.radius.baseDistanceKm, perKmRate: f.radius.perKmRate, maxRadiusKm: f.radius.maxRadiusKm } : null,
       payments: {
         paystack: pay.paystackEnabled && cfg?.onboardingStatus === 'active',
         bankTransfer: pay.bankTransferEnabled && !!cfg?.bank?.accountNumber,
@@ -148,6 +150,7 @@ r.post('/r/:slug/whatsapp-order', validate(z.object({
   sendEmail({ to: rest.email, type: 'order_intent', restaurant: rest._id, order: order._id, dedupeKey: `intent:${order._id}`,
     subject: `New WhatsApp order intent ${order.reference}`,
     body: `<p>A customer started an order (${naira(subtotal)}). It is <b>not confirmed</b> until they message you on WhatsApp.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}` });
+  notifyRestaurant(rest._id, { title: 'New WhatsApp order request', body: `${order.reference} · ${naira(subtotal)}`, url: '/dashboard/orders', tag: `order-${order._id}` });
   res.status(201).json(waResponse(rest, order));
 }));
 
@@ -173,9 +176,9 @@ function waResponse(rest, order) {
 }
 
 /* ---------- PRO: checkout ---------- */
-const quoteSchema = z.object({ placeId: z.string().max(300), sessionToken: z.string().max(64).optional() });
+const quoteSchema = z.object({ placeId: z.string().max(2000), sessionToken: z.string().max(64).optional() });
 
-// Address suggestions for the delivery box, biased towards the restaurant. Goes through our server, so no Mapbox token in the browser.
+// Address suggestions for the delivery box, biased towards the restaurant. Goes through our server, so no Google key in the browser.
 r.post('/r/:slug/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional() })), wrap(async (req, res) => {
   const found = await findRestaurant(req.params.slug);
   if (!found?.isPro) return res.status(404).json({ error: 'Not found' });
@@ -190,7 +193,7 @@ r.post('/r/:slug/delivery-quote', validate(quoteSchema), wrap(async (req, res) =
   if (!found?.isPro || !found.rest.fulfillment.deliveryEnabled) return res.status(404).json({ error: 'Delivery is not offered' });
   const q = await quoteDelivery(found.rest, req.body.placeId, req.body.sessionToken);
   if (!q.ok) return res.status(422).json({ error: `Sorry, that address is outside ${found.rest.name}'s delivery range (${found.rest.fulfillment.radius.maxRadiusKm} km).`, distanceKm: q.distanceKm });
-  res.json({ fee: q.fee, distanceKm: q.distanceKm, address: q.place.address, lat: q.place.lat, lng: q.place.lng });
+  res.json({ fee: q.fee, distanceKm: q.distanceKm, address: q.place.address });
 }));
 
 const checkoutSchema = z.object({
@@ -247,16 +250,26 @@ r.post('/r/:slug/checkout', validate(checkoutSchema), wrap(async (req, res) => {
   });
 
   const trackUrl = `${process.env.CLIENT_URL}/track/${token}`;
+  // Paystack: start the payment right now so the customer goes straight to the payment page (no extra page or tap).
+  let paymentUrl;
+  if (b.paymentMethod === 'paystack') {
+    try { paymentUrl = (await startOrderPayment(order, rest, `${trackUrl}?pay=1`)).authorizationUrl; }
+    catch (e) { console.error('[checkout] could not start payment', e.message); } // the tracking page still offers "Pay now"
+  }
   // Emails after save; failures never affect the order
   sendEmail({ to: b.customerEmail, type: 'order_confirmation', restaurant: rest._id, order: order._id, dedupeKey: `conf:${order._id}`,
     subject: `Order ${order.reference} received`,
     body: `<p>Thanks ${b.customerName}! Total: <b>${naira(order.total)}</b>.</p>${btn(trackUrl, 'Track your order')}` });
-  sendEmail({ to: rest.email, type: 'new_order', restaurant: rest._id, order: order._id, dedupeKey: `new:${order._id}`,
-    subject: `New order ${order.reference}`, body: `<p>${naira(order.total)} via ${b.fulfillment}.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}` });
+  // Orders that need money first are announced to the restaurant only once payment is confirmed or proof is uploaded.
+  if (b.paymentMethod === 'pod') {
+    sendEmail({ to: rest.email, type: 'new_order', restaurant: rest._id, order: order._id, dedupeKey: `new:${order._id}`,
+      subject: `New order ${order.reference}`, body: `<p>${naira(order.total)} via ${b.fulfillment}.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}` });
+    notifyRestaurant(rest._id, { title: 'New order', body: `${order.reference} · ${naira(order.total)} (pay on delivery)`, url: '/dashboard/orders', tag: `order-${order._id}` });
+  }
 
   res.status(201).json({
     reference: order.reference, total: order.total, subtotal, deliveryFee, trackingToken: token,
-    paymentMethod: b.paymentMethod, paymentStatus,
+    paymentMethod: b.paymentMethod, paymentStatus, paymentUrl,
     next: b.paymentMethod === 'paystack' ? 'pay_online' : b.paymentMethod === 'bank_transfer' ? 'upload_proof' : 'done',
   });
 }));

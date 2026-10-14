@@ -39,6 +39,11 @@ export const PAYMENT_STATUSES = [
 ];
 
 // Valid order-status transitions
+// An order the restaurant can act on right now: no payment needed first (WhatsApp, pay on delivery) or the money is confirmed.
+export const PAID_STATES = ['paid', 'paid_manual'];
+export const needsPaymentFirst = (o) => o.channel === 'checkout' && ['paystack', 'bank_transfer'].includes(o.paymentMethod) && !PAID_STATES.includes(o.paymentStatus);
+export const ACTIONABLE = { $or: [{ paymentMethod: { $in: ['none', 'pod'] } }, { paymentStatus: { $in: PAID_STATES } }] };
+
 export const ORDER_TRANSITIONS = {
   awaiting_whatsapp: ['accepted', 'cancelled'],
   pending: ['accepted', 'cancelled'],

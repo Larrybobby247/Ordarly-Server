@@ -18,7 +18,7 @@ const registerSchema = z.object({
   email: z.string().email(),
   phone: z.string().min(10).max(20),
   password: z.string().min(8).max(100),
-  address: z.string().min(3).max(200), placeId: z.string().max(500).optional(), sessionToken: z.string().max(64).optional(),
+  address: z.string().min(3).max(400), placeId: z.string().max(2000).optional(), sessionToken: z.string().max(64).optional(),
   state: z.enum(NIGERIAN_STATES),
   slug: z.string().optional(),
 });

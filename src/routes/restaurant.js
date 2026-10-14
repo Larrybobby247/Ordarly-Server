@@ -16,7 +16,7 @@ const profileSchema = z.object({
   phone: z.string().max(20).optional(),
   email: z.string().email().optional(),
   whatsapp: z.string().optional(),
-  address: z.string().max(200).optional(), placeId: z.string().max(500).optional(), sessionToken: z.string().max(64).optional(),
+  address: z.string().max(400).optional(), placeId: z.string().max(2000).optional(), sessionToken: z.string().max(64).optional(),
   state: z.enum(NIGERIAN_STATES).optional(),
   logo: z.string().url().optional().or(z.literal('')),
   cover: z.string().url().optional().or(z.literal('')),
@@ -118,13 +118,13 @@ r.get('/fulfillment', wrap(async (req, res) => {
   res.json({ fulfillment: f, deliveryReady: deliveryReady(f), mapsConfigured: placesConfigured() });
 }));
 
-// Address search for the restaurant's own address (all plans). Goes through our server, so the Mapbox search token never reaches the browser.
+// Address search for the restaurant's own address (all plans). Goes through our server, so the Google key never reaches the browser.
 r.post('/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional() })), wrap(async (req, res) => {
   res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken }) });
 }));
 
 const radiusSchema = z.object({
-  placeId: z.string().max(300).optional(),
+  placeId: z.string().max(2000).optional(),
   baseFee: z.number().min(0).max(100000), baseDistanceKm: z.number().min(0.5).max(50),
   perKmRate: z.number().min(0).max(100000), maxRadiusKm: z.number().min(1).max(100),
   sessionToken: z.string().max(64).optional(),

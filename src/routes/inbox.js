@@ -4,6 +4,8 @@ import { Complaint, Restaurant, RestaurantMessage, Order } from '../models/index
 import { z, validate, wrap, escapeHtml } from '../utils/helpers.js';
 import { requireAuth, requireRole, loadRestaurant } from '../middleware/auth.js';
 import { sendEmail, btn } from '../services/email.js';
+import { notifyRestaurant } from '../services/notify.js';
+import { ACTIONABLE } from '../config/plans.js';
 
 const ref = (p) => `${p}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 const rx = (s) => new RegExp(String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
@@ -30,6 +32,7 @@ publicContact.post('/contact/:slug', validate(z.object({
     body: `<p><b>${escapeHtml(m.name)}</b> (${escapeHtml(m.email)}${m.phone ? `, ${escapeHtml(m.phone)}` : ''}) wrote:</p>
 <p style="white-space:pre-wrap">${escapeHtml(m.message).slice(0, 1200)}</p>${btn(`${process.env.CLIENT_URL}/dashboard/messages`, 'Open your messages')}`,
   });
+  notifyRestaurant(rest._id, { title: `Message from ${m.name}`, body: String(m.message).slice(0, 120), url: '/dashboard/messages', tag: `msg-${m._id}` });
   sendEmail({
     to: m.email, type: 'customer_message_ack', dedupeKey: `rmsg-ack:${m._id}`, restaurant: rest._id,
     subject: `${rest.name} received your message`,
@@ -48,7 +51,7 @@ r.get('/summary', wrap(async (req, res) => {
   const [unreadMessages, activeReports, newOrders, proofsToReview] = await Promise.all([
     RestaurantMessage.countDocuments({ restaurant: rid, status: 'new' }),
     Complaint.countDocuments({ restaurant: rid, source: 'restaurant', status: { $in: ['open', 'reviewed', 'in_review'] } }),
-    Order.countDocuments({ restaurant: rid, status: { $in: ['pending', 'awaiting_whatsapp'] } }),
+    Order.countDocuments({ restaurant: rid, status: { $in: ['pending', 'awaiting_whatsapp'] }, ...ACTIONABLE }),
     Order.countDocuments({ restaurant: rid, paymentStatus: 'awaiting_verification', status: { $ne: 'cancelled' } }),
   ]);
   res.json({ unreadMessages, activeReports, newOrders, proofsToReview });

@@ -14,7 +14,8 @@ export async function ps(path, { method = 'GET', body } = {}) {
     method,
     headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
-  });
+    signal: AbortSignal.timeout(12000), // never hang a customer on a slow gateway call
+  }).catch((e) => { throw new PaystackError(e.name === 'TimeoutError' ? 'Paystack is taking too long to respond. Please try again.' : 'Could not reach Paystack. Please try again.', 504); });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.status === false) throw new PaystackError(data.message || `Paystack error (${res.status})`, res.status >= 500 ? 502 : 400);
   return data;

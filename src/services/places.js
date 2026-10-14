@@ -1,46 +1,46 @@
-// Mapbox Search Box API (suggest + retrieve) and distance helpers. The Mapbox token lives ONLY on the server
-// (MAPBOX_ACCESS_TOKEN); the browser talks to our own /places endpoints for search, so no search token is shipped.
-import crypto from 'crypto';
+// Google Places (New) + distance helpers. The Google key lives ONLY on the server (GOOGLE_MAPS_API_KEY);
+// the browser talks to our own /places endpoints, so no key is ever shipped to the frontend.
+const KEY = () => process.env.GOOGLE_MAPS_API_KEY;
+export const placesConfigured = () => !!KEY();
 
-const TOKEN = () => process.env.MAPBOX_ACCESS_TOKEN;
-export const placesConfigured = () => !!TOKEN();
-const BASE = 'https://api.mapbox.com/search/searchbox/v1';
-
-const ID_RE = /^[A-Za-z0-9_\-=.:]{8,500}$/;
+const ID_RE = /^[A-Za-z0-9_-]{10,300}$/;
 export const validPlaceId = (id) => typeof id === 'string' && ID_RE.test(id);
-const sess = (t) => (t && /^[A-Za-z0-9-]{8,64}$/.test(t) ? t : crypto.randomUUID());
-const fail = (msg, status) => Object.assign(new Error(msg), { status });
 
 export async function autocomplete(input, { bias, sessionToken } = {}) {
-  if (!TOKEN()) throw fail('Address search is not set up yet.', 503);
-  const qs = new URLSearchParams({
-    q: String(input).slice(0, 200), access_token: TOKEN(), session_token: sess(sessionToken),
-    country: 'ng', language: 'en', limit: '6',
+  if (!KEY()) throw Object.assign(new Error('Address search is not set up yet.'), { status: 503 });
+  const body = { input: String(input).slice(0, 120), includedRegionCodes: ['ng'], languageCode: 'en' };
+  if (sessionToken) body.sessionToken = String(sessionToken).slice(0, 64);
+  if (bias?.lat != null && bias?.lng != null) {
+    body.locationBias = { circle: { center: { latitude: bias.lat, longitude: bias.lng }, radius: Math.min(50000, Math.max(1000, bias.radiusM || 30000)) } };
+  }
+  const res = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json', 'X-Goog-Api-Key': KEY(),
+      'X-Goog-FieldMask': 'suggestions.placePrediction.placeId,suggestions.placePrediction.structuredFormat,suggestions.placePrediction.text',
+    },
+    body: JSON.stringify(body),
   });
-  if (bias?.lat != null && bias?.lng != null) qs.set('proximity', `${bias.lng},${bias.lat}`);
-  const res = await fetch(`${BASE}/suggest?${qs}`);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) { console.error('[places] suggest', res.status, data?.message || data?.error); throw fail('Address search is unavailable right now.', 502); }
-  return (data.suggestions || []).filter((x) => x.mapbox_id).map((x) => ({
-    placeId: x.mapbox_id, main: x.name, secondary: x.place_formatted || '',
-    text: x.full_address || [x.name, x.place_formatted].filter(Boolean).join(', '),
+  if (!res.ok) { console.error('[places] autocomplete', res.status, data?.error?.message); throw Object.assign(new Error('Address search is unavailable right now.'), { status: 502 }); }
+  return (data.suggestions || []).filter((s) => s.placePrediction).map(({ placePrediction: p }) => ({
+    placeId: p.placeId, main: p.structuredFormat?.mainText?.text || p.text?.text, secondary: p.structuredFormat?.secondaryText?.text || '', text: p.text?.text,
   }));
 }
 
-const cache = new Map(); // placeId -> { at, value }; a place's coordinates don't change, so a short cache saves API calls
+const cache = new Map(); // placeId -> { at, value }; coordinates of a place don't change, so a short cache saves API calls
 export async function placeDetails(placeId, sessionToken) {
-  if (!TOKEN()) throw fail('Address search is not set up yet.', 503);
-  if (!validPlaceId(placeId)) throw fail('Please pick an address from the list.', 400);
+  if (!KEY()) throw Object.assign(new Error('Address search is not set up yet.'), { status: 503 });
+  if (!validPlaceId(placeId)) throw Object.assign(new Error('Please pick an address from the list.'), { status: 400 });
   const hit = cache.get(placeId);
   if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
-  const qs = new URLSearchParams({ access_token: TOKEN(), session_token: sess(sessionToken), language: 'en' });
-  const res = await fetch(`${BASE}/retrieve/${encodeURIComponent(placeId)}?${qs}`);
+  const qs = sessionToken ? `?sessionToken=${encodeURIComponent(String(sessionToken).slice(0, 64))}` : '';
+  const res = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}${qs}`, {
+    headers: { 'X-Goog-Api-Key': KEY(), 'X-Goog-FieldMask': 'id,formattedAddress,location,displayName' },
+  });
   const data = await res.json().catch(() => ({}));
-  const f = data?.features?.[0];
-  const [lng, lat] = f?.geometry?.coordinates || [];
-  if (!res.ok || typeof lat !== 'number' || typeof lng !== 'number') { console.error('[places] retrieve', res.status, data?.message || data?.error); throw fail('We could not find that address. Please pick another.', 400); }
-  const pr = f.properties || {};
-  const value = { placeId, address: pr.full_address || [pr.name, pr.place_formatted].filter(Boolean).join(', '), lat, lng };
+  if (!res.ok || !data.location) { console.error('[places] details', res.status, data?.error?.message); throw Object.assign(new Error('We could not find that address. Please pick another.'), { status: 400 }); }
+  const value = { placeId, address: data.formattedAddress || data.displayName?.text || '', lat: data.location.latitude, lng: data.location.longitude };
   if (cache.size > 500) cache.clear();
   cache.set(placeId, { at: Date.now(), value });
   return value;
@@ -64,7 +64,7 @@ export function radiusFee(radius, km) {
   return { ok: true, fee: Math.ceil(raw / 100 - 1e-9) * 100 };
 }
 
-/** Full quote for a customer's place. Coordinates are resolved on the server from the Mapbox place id, never taken from the browser. */
+/** Full quote for a customer's place. Coordinates are resolved on the server from the Google place id, never taken from the browser. */
 export async function quoteDelivery(rest, placeId, sessionToken) {
   const f = rest.fulfillment;
   if (!f?.radius?.configured || f.location?.lat == null) throw Object.assign(new Error('Delivery is not set up for this restaurant.'), { status: 400 });

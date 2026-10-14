@@ -6,6 +6,7 @@ import { isProActive } from '../services/subscription.js';
 import { startOrderPayment, verifyOrderPayment } from '../services/orderPayments.js';
 import { sniffImage, saveProof } from '../services/storage.js';
 import { sendEmail, btn } from '../services/email.js';
+import { notifyRestaurant } from '../services/notify.js';
 
 const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
@@ -19,9 +20,9 @@ async function orderByToken(token) {
 r.post('/track/:token/pay', wrap(async (req, res) => {
   const order = await orderByToken(req.params.token);
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  const rest = await Restaurant.findById(order.restaurant);
+  const [rest, sub] = await Promise.all([Restaurant.findById(order.restaurant), Subscription.findOne({ restaurant: order.restaurant })]);
   if (!rest || rest.status !== 'active') return res.status(409).json({ error: 'Restaurant unavailable' });
-  if (!isProActive(await Subscription.findOne({ restaurant: rest._id })))
+  if (!isProActive(sub))
     return res.status(409).json({ error: 'Online payment is not available for this restaurant right now.' });
   try {
     const out = await startOrderPayment(order, rest, `${process.env.CLIENT_URL}/track/${req.params.token}?pay=1`);
@@ -64,6 +65,7 @@ r.post('/track/:token/proof', upload.single('proof'), wrap(async (req, res) => {
   sendEmail({ to: rest?.email, type: 'proof_submitted', restaurant: order.restaurant, order: order._id,
     dedupeKey: `proofsub:${order._id}:${fileRef}`, subject: `Payment proof submitted for ${order.reference}`,
     body: `<p>${order.customerName} says they transferred <b>${naira(order.total)}</b>. Check your bank records before accepting.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Review proof')}` });
+  notifyRestaurant(order.restaurant, { title: 'Payment proof to review', body: `${order.reference} · ${naira(order.total)} bank transfer`, url: '/dashboard/orders', tag: `order-${order._id}` });
   res.status(201).json({ paymentStatus: 'awaiting_verification' });
 }));
 
