@@ -3,12 +3,14 @@ import dns from 'dns/promises';
 import { Restaurant, Category, Meal, PaymentConfig, Order } from '../models/index.js';
 import { z, validate, wrap, normalisePhone, validWhatsapp, slugify, randomToken } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant, requirePro } from '../middleware/auth.js';
+import { clearCacheOnWrite } from '../services/publicCache.js';
 import { RESERVED_SLUGS, NIGERIAN_STATES } from '../config/plans.js';
 import { startTrial } from '../services/subscription.js';
 import { autocomplete, placeDetails, placesConfigured } from '../services/places.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant);
+r.use(clearCacheOnWrite); // PERF: owner edits clear the public-page cache so customers see changes immediately
 
 const profileSchema = z.object({
   name: z.string().min(2).max(80).optional(),
@@ -190,14 +192,17 @@ r.get('/analytics', wrap(async (req, res) => {
   const rid = req.restaurant._id;
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const weekAgo = new Date(Date.now() - 7 * 86400000);
-  const [total, today, week, awaiting, completed, cancelled] = await Promise.all([
-    Order.countDocuments({ restaurant: rid }),
-    Order.countDocuments({ restaurant: rid, createdAt: { $gte: startOfDay } }),
-    Order.countDocuments({ restaurant: rid, createdAt: { $gte: weekAgo } }),
-    Order.countDocuments({ restaurant: rid, status: { $in: ['awaiting_whatsapp', 'pending'] } }),
-    Order.countDocuments({ restaurant: rid, status: 'completed' }),
-    Order.countDocuments({ restaurant: rid, status: 'cancelled' }),
+  // PERF (changed): this used to run SIX separate count queries on every dashboard visit. One aggregation (grouped by status, using the
+  // restaurant index) now returns all the same numbers, so the Overview page needs a single database round trip for its counts.
+  const byStatus = await Order.aggregate([
+    { $match: { restaurant: rid } },
+    { $group: { _id: '$status', n: { $sum: 1 },
+      today: { $sum: { $cond: [{ $gte: ['$createdAt', startOfDay] }, 1, 0] } },
+      week: { $sum: { $cond: [{ $gte: ['$createdAt', weekAgo] }, 1, 0] } } } },
   ]);
+  const sumOf = (field, statuses) => byStatus.filter((x) => !statuses || statuses.includes(x._id)).reduce((a, x) => a + x[field], 0);
+  const total = sumOf('n'), today = sumOf('today'), week = sumOf('week');
+  const awaiting = sumOf('n', ['awaiting_whatsapp', 'pending']), completed = sumOf('n', ['completed']), cancelled = sumOf('n', ['cancelled']);
   const out = { total, today, week, awaiting, completed, cancelled, isPro: req.isPro };
   if (req.isPro) {
     const sum = (match) => Order.aggregate([{ $match: { restaurant: rid, ...match } }, { $group: { _id: null, v: { $sum: '$total' }, n: { $sum: 1 } } }]);

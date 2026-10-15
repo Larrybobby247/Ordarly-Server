@@ -2,9 +2,11 @@ import { Router } from 'express';
 import { Category, Meal } from '../models/index.js';
 import { z, validate, wrap } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant } from '../middleware/auth.js';
+import { clearCacheOnWrite } from '../services/publicCache.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant);
+r.use(clearCacheOnWrite); // PERF: owner edits clear the public-page cache so customers see changes immediately
 
 const limitInfo = async (req) => {
   const max = req.isPro ? null : req.planConfig.free.maxActiveMeals;
@@ -14,8 +16,9 @@ const limitInfo = async (req) => {
 
 r.get('/', wrap(async (req, res) => {
   const [categories, meals, limit] = await Promise.all([
-    Category.find({ restaurant: req.restaurant._id }).sort('sort name'),
-    Meal.find({ restaurant: req.restaurant._id }).sort('-createdAt'),
+    // PERF (changed): .lean() returns plain objects (faster, less memory) because this endpoint only reads and sends JSON.
+    Category.find({ restaurant: req.restaurant._id }).sort('sort name').lean(),
+    Meal.find({ restaurant: req.restaurant._id }).sort('-createdAt').lean(),
     limitInfo(req),
   ]);
   res.json({ categories, meals, limit });

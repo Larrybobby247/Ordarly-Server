@@ -33,6 +33,11 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
 
+// PERF (new): gzip/brotli-style compression for JSON responses (menus, order lists, admin tables), typically 70-90% smaller on the wire.
+// Loaded defensively: if the package is not installed yet the server still starts, just without compression.
+try { const { default: compression } = await import('compression'); app.use(compression()); }
+catch { console.warn('[perf] compression not installed (run npm install in server/)'); }
+
 // Webhooks need the raw body, so mount before express.json
 app.use('/api/webhooks', webhookRouter);
 
@@ -89,7 +94,9 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: msg });
 });
 
-await mongoose.connect(process.env.MONGODB_URI);
+// PERF (changed): one shared connection pool for the whole process (never connect per request). A small warm minimum avoids a
+// slow first query after quiet periods; the max keeps us well inside typical Atlas connection limits. Failing fast beats hanging.
+await mongoose.connect(process.env.MONGODB_URI, { maxPoolSize: 20, minPoolSize: 2, serverSelectionTimeoutMS: 10000 });
 await getPlanConfig();
 
 // Subscription sweep every 10 min, email retries every 5 min (server-side timestamps, UTC)

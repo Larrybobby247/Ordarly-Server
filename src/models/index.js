@@ -97,7 +97,7 @@ const itemSnap = new Schema({
   quantity: Number,
 }, { _id: false });
 
-export const Order = mongoose.model('Order', new Schema({
+const orderSchema = new Schema({
   restaurant: oid('Restaurant', { required: true, index: true }),
   reference: { type: String, required: true, unique: true },
   channel: { type: String, enum: ['whatsapp', 'checkout'], required: true },
@@ -113,7 +113,14 @@ export const Order = mongoose.model('Order', new Schema({
   notes: { type: String, maxlength: 500 },
   idempotencyKey: { type: String, index: true, sparse: true },
   audit: [{ at: Date, by: String, field: String, from: String, to: String, note: String }],
-}, { timestamps: true }));
+}, { timestamps: true });
+// PERF (new): compound indexes that match how orders are really queried (always per restaurant, newest first, often by status).
+// They replace in-memory sorting/filtering for the Orders page, today's counters and the dashboard statistics.
+// Only 3 extra indexes on Order, so writes stay cheap. MongoDB builds them automatically on start-up (see the deployment note in the README).
+orderSchema.index({ restaurant: 1, createdAt: -1 });          // orders list, "today" counters, analytics ranges
+orderSchema.index({ restaurant: 1, status: 1, createdAt: -1 }); // filtered by status, new-order badge
+orderSchema.index({ restaurant: 1, paymentStatus: 1 });        // "proofs to review" counter
+export const Order = mongoose.model('Order', orderSchema);
 
 // Food-order payments and subscription payments are separate collections on purpose.
 export const OrderPayment = mongoose.model('OrderPayment', new Schema({
@@ -201,7 +208,7 @@ export const ErrorLog = mongoose.model('ErrorLog', new Schema({
   route: String, method: String, message: String, stack: String, status: Number,
 }, { timestamps: true }));
 
-export const Complaint = mongoose.model('Complaint', new Schema({
+const complaintSchema = new Schema({
   reference: { type: String, unique: true },
   kind: { type: String, enum: ['complaint', 'question', 'feedback'], default: 'question' },
   source: { type: String, enum: ['contact', 'restaurant_page', 'tracking', 'restaurant'], default: 'contact' },
@@ -211,16 +218,23 @@ export const Complaint = mongoose.model('Complaint', new Schema({
   priority: { type: String, enum: ['low', 'normal', 'high'], default: 'normal' },
   notes: [{ _id: false, by: String, at: Date, text: String }],
   replies: [{ _id: false, by: String, at: Date, message: String }],
-}, { timestamps: true }));
+}, { timestamps: true });
+// PERF (new): the dashboard's "open reports" counter (restaurant + source + status) and the admin inbox (status filter, newest first).
+complaintSchema.index({ restaurant: 1, source: 1, status: 1 });
+complaintSchema.index({ status: 1, createdAt: -1 });
+export const Complaint = mongoose.model('Complaint', complaintSchema);
 
 // Messages customers send to a restaurant from its public page. Visible only to that restaurant.
-export const RestaurantMessage = mongoose.model('RestaurantMessage', new Schema({
+const restaurantMessageSchema = new Schema({
   restaurant: oid('Restaurant', { required: true, index: true }),
   reference: { type: String, unique: true },
   name: String, email: String, phone: String, subject: String, message: String, orderRef: String,
   status: { type: String, enum: ['new', 'read', 'replied', 'closed'], default: 'new', index: true },
   replies: [{ _id: false, by: String, at: Date, message: String }],
-}, { timestamps: true }));
+}, { timestamps: true });
+// PERF (new): the Messages tab and the unread badge filter by restaurant + status and sort newest first.
+restaurantMessageSchema.index({ restaurant: 1, status: 1, createdAt: -1 });
+export const RestaurantMessage = mongoose.model('RestaurantMessage', restaurantMessageSchema);
 
 // Browser push subscriptions (one per device/browser) so restaurant owners get device notifications.
 export const PushSubscription = mongoose.model('PushSubscription', new Schema({

@@ -7,6 +7,7 @@ import { isProActive } from '../services/subscription.js';
 import { sendEmail, btn } from '../services/email.js';
 import { startOrderPayment } from '../services/orderPayments.js';
 import { notifyRestaurant } from '../services/notify.js';
+import { getCached, setCached } from '../services/publicCache.js';
 
 const r = Router();
 
@@ -14,7 +15,7 @@ async function findRestaurant(key, byDomain = false) {
   const q = byDomain ? { customDomain: key.toLowerCase(), customDomainStatus: 'verified' } : { slug: key.toLowerCase() };
   const rest = await Restaurant.findOne(q);
   if (!rest || rest.status !== 'active') return null;
-  const sub = await Subscription.findOne({ restaurant: rest._id });
+  const sub = await Subscription.findOne({ restaurant: rest._id }).lean(); // PERF: plain object, read-only
   const isPro = isProActive(sub);
   if (byDomain && !isPro) return null; // custom domains only serve while Pro is active
   return { rest, isPro };
@@ -77,15 +78,23 @@ async function publicPayload(found) {
   };
 }
 
-r.get('/by-domain/:domain', wrap(async (req, res) => {
-  const f = await findRestaurant(req.params.domain, true);
-  f ? res.json(await publicPayload(f)) : res.status(404).json({ error: 'Not found' });
-}));
+// PERF (changed): public pages are served from a 30-second server cache, and browsers/CDNs may reuse the response for 10 seconds
+// (stale-while-revalidate lets them show it instantly while refreshing). The data is public and the cache is cleared whenever the owner edits anything.
+const PUBLIC_CACHE_HEADER = 'public, max-age=10, stale-while-revalidate=60';
+async function servePublic(res, key, find, notFound) {
+  const hit = getCached(key);
+  if (hit) { res.set('Cache-Control', PUBLIC_CACHE_HEADER); return res.json(hit); }
+  const f = await find();
+  if (!f) return res.status(404).json({ error: notFound });
+  const payload = await publicPayload(f);
+  setCached(key, payload);
+  res.set('Cache-Control', PUBLIC_CACHE_HEADER);
+  return res.json(payload);
+}
 
-r.get('/r/:slug', wrap(async (req, res) => {
-  const f = await findRestaurant(req.params.slug);
-  f ? res.json(await publicPayload(f)) : res.status(404).json({ error: 'Restaurant not found' });
-}));
+r.get('/by-domain/:domain', wrap((req, res) => servePublic(res, `d:${req.params.domain.toLowerCase()}`, () => findRestaurant(req.params.domain, true), 'Not found')));
+
+r.get('/r/:slug', wrap((req, res) => servePublic(res, `s:${req.params.slug.toLowerCase()}`, () => findRestaurant(req.params.slug), 'Restaurant not found')));
 
 /* ---------- Cart pricing: ALWAYS from DB (meal price + chosen add-ons) ---------- */
 const cartSchema = z.array(z.object({
@@ -94,7 +103,8 @@ const cartSchema = z.array(z.object({
 
 async function priceCart(rest, cart) {
   const ids = [...new Set(cart.map((c) => c.mealId))].filter((id) => mongoose.isValidObjectId(id));
-  const meals = await Meal.find({ _id: { $in: ids }, restaurant: rest._id });
+  // PERF (changed): only the fields needed to price the cart, as plain objects (.lean()) instead of full Mongoose documents.
+  const meals = await Meal.find({ _id: { $in: ids }, restaurant: rest._id }).select('name price available addons').lean();
   const map = new Map(meals.map((m) => [String(m._id), m]));
   const unavailable = [], items = [];
   for (const c of cart) {

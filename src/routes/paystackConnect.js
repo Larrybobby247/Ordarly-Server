@@ -3,10 +3,12 @@ import bcrypt from 'bcryptjs';
 import { PaymentConfig, User } from '../models/index.js';
 import { z, validate, wrap } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant, requirePro } from '../middleware/auth.js';
+import { clearCacheOnWrite } from '../services/publicCache.js';
 import { ps, listNigerianBanks, resolveAccount, PaystackError } from '../services/paystack.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant, requirePro('Online payments'));
+r.use(clearCacheOnWrite); // PERF: payment-setting changes clear the public-page cache
 
 /**
  * Subaccount status mapping. Paystack's docs show `active` and `is_verified` on a subaccount but do not

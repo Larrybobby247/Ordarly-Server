@@ -9,6 +9,7 @@ const r = Router();
 
 // Public platform info: support email, announcement banner, whether sign-ups are open.
 r.get('/platform', wrap(async (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300'); // PERF (new): public, rarely-changing settings
   const [s, plans] = await Promise.all([getPlatformSettings(), getPlanConfig()]);
   res.json({
     pricing: { proPriceNgn: plans.pro.priceNgn, trialDays: plans.pro.trialDays, freeMeals: plans.free.maxActiveMeals },
