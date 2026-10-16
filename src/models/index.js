@@ -129,7 +129,12 @@ export const OrderPayment = mongoose.model('OrderPayment', new Schema({
   provider: { type: String, default: 'paystack' },
   providerReference: { type: String, unique: true, sparse: true },
   amount: Number, currency: { type: String, default: 'NGN' },
-  status: { type: String, default: 'pending' },
+  status: {
+  type: String,
+  enum: ['pending', 'success', 'failed', 'attention'],
+  default: 'pending',
+},
+
   verifiedAt: Date,
   raw: Schema.Types.Mixed,
 }, { timestamps: true }));
