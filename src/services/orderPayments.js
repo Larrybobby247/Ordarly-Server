@@ -12,7 +12,13 @@ const nairaToKobo = (amount) => Math.round(Number(amount) * 100);
 // Always normalise it before reading fields from it.
 const parseMeta = (m) => {
   if (!m) return {};
-  if (typeof m === 'string') { try { return JSON.parse(m) || {}; } catch { return {}; } }
+  if (typeof m === 'string') {
+    try {
+      return JSON.parse(m) || {};
+    } catch {
+      return {};
+    }
+  }
   return m;
 };
 
@@ -29,12 +35,12 @@ export async function startOrderPayment(order, restaurant, callbackUrl) {
   if (!['awaiting_payment', 'pending', 'failed'].includes(order.paymentStatus) || order.paymentMethod !== 'paystack')
     throw Object.assign(new Error('This order is not awaiting payment.'), { status: 409 });
   if (await OrderPayment.exists({ order: order._id, status: 'success' }))
-  throw Object.assign(new Error('This order has already been paid.'), { status: 409 });
+    throw Object.assign(new Error('This order has already been paid.'), { status: 409 });
 
-if (await OrderPayment.exists({ order: order._id, status: 'attention' }))
-  throw Object.assign(new Error(
-    'Paystack confirms that a payment was received for this order, but it still needs to be matched manually. Do not pay again; contact the restaurant or support with your payment reference.'
-  ), { status: 409 });
+  if (await OrderPayment.exists({ order: order._id, status: 'attention' }))
+    throw Object.assign(new Error(
+      'Paystack confirms that a payment was received for this order, but it still needs to be matched manually. Do not pay again; contact the restaurant or support with your payment reference.'
+    ), { status: 409 });
 
   if (!order.customerEmail) throw Object.assign(new Error('Order has no customer email.'), { status: 400 });
 
@@ -80,7 +86,7 @@ export async function verifyOrderPayment(payment) {
 
   const expected = nairaToKobo(order.total);
   const actual = Number(t.amount);
-  const metadata = t.metadata || {};
+  const metadata = parseMeta(t.metadata);
 
   const amountMatches = Number.isFinite(actual) && actual === expected;
   const currencyMatches = asString(t.currency).toUpperCase() === 'NGN';
@@ -229,19 +235,4 @@ export async function verifyOrderPayment(payment) {
   }
 
   return { status: 'pending' };
-}
-
-
-  if (['failed', 'abandoned', 'reversed'].includes(t.status)) {
-    const flipped = await OrderPayment.findOneAndUpdate({ _id: payment._id, status: 'pending' }, { status: 'failed' });
-    if (flipped && order.paymentStatus === 'pending') {
-      audit(order, 'paystack', 'paymentStatus', 'pending', 'failed', t.status);
-      order.paymentStatus = 'failed'; await order.save();
-      sendEmail({ to: order.customerEmail, type: 'payment_failed', restaurant: order.restaurant, order: order._id,
-        dedupeKey: `payfail:${payment.providerReference}`, subject: `Payment for ${order.reference} did not go through`,
-        body: `<p>Your payment was not completed and you have not been charged for this attempt. Open your tracking page to try again, or contact the restaurant.</p>` });
-    }
-    return { status: 'failed' };
-  }
-  return { status: 'pending' }; // ongoing / not yet paid
 }
