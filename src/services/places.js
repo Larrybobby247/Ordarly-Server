@@ -1,49 +1,60 @@
-// Google Places (New) + distance helpers. The Google key lives ONLY on the server (GOOGLE_MAPS_API_KEY);
-// the browser talks to our own /places endpoints, so no key is ever shipped to the frontend.
-const KEY = () => process.env.GOOGLE_MAPS_API_KEY;
-export const placesConfigured = () => !!KEY();
+// LocationIQ address autocomplete + distance helpers. The LocationIQ key lives ONLY on the server (LOCATIONIQ_API_KEY);
+// the browser talks to our own /places endpoints, so no key is ever shipped to the frontend. No map is used: we only need
+// address suggestions and their coordinates to calculate the delivery distance.
+//
+// How the "never trust the browser" rule is kept: LocationIQ's autocomplete already returns coordinates, so there is no second lookup.
+// Instead each suggestion gets a `placeId` that is a SIGNED token holding the address + coordinates. When the customer or restaurant
+// submits it, the server checks the signature (made with JWT_SECRET). A browser cannot invent or edit coordinates to get a cheaper fee,
+// and this works across restarts and several server instances (no memory or database needed).
+import crypto from 'crypto';
 
-const ID_RE = /^[A-Za-z0-9_-]{10,300}$/;
-export const validPlaceId = (id) => typeof id === 'string' && ID_RE.test(id);
+const KEY = () => process.env.LOCATIONIQ_API_KEY;
+export const placesConfigured = () => !!KEY() && !!process.env.JWT_SECRET;
 
-export async function autocomplete(input, { bias, sessionToken } = {}) {
-  if (!KEY()) throw Object.assign(new Error('Address search is not set up yet.'), { status: 503 });
-  const body = { input: String(input).slice(0, 120), includedRegionCodes: ['ng'], languageCode: 'en' };
-  if (sessionToken) body.sessionToken = String(sessionToken).slice(0, 64);
-  if (bias?.lat != null && bias?.lng != null) {
-    body.locationBias = { circle: { center: { latitude: bias.lat, longitude: bias.lng }, radius: Math.min(50000, Math.max(1000, bias.radiusM || 30000)) } };
-  }
-  const res = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json', 'X-Goog-Api-Key': KEY(),
-      'X-Goog-FieldMask': 'suggestions.placePrediction.placeId,suggestions.placePrediction.structuredFormat,suggestions.placePrediction.text',
-    },
-    body: JSON.stringify(body),
+const fail = (msg, status) => Object.assign(new Error(msg), { status });
+
+const sig = (body) => crypto.createHmac('sha256', process.env.JWT_SECRET).update(body).digest('base64url').slice(0, 22);
+function signPlace({ address, lat, lng }) {
+  const body = Buffer.from(JSON.stringify({ a: address.slice(0, 140), y: Number(lat.toFixed(6)), x: Number(lng.toFixed(6)) })).toString('base64url');
+  return `${body}.${sig(body)}`;
+}
+function readPlace(id) {
+  if (!validPlaceId(id) || !process.env.JWT_SECRET) return null;
+  const [body, given] = id.split('.');
+  const want = sig(body);
+  if (given.length !== want.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(want))) return null; // forged or edited
+  try { const p = JSON.parse(Buffer.from(body, 'base64url').toString()); return typeof p.y === 'number' && typeof p.x === 'number' ? p : null; } catch { return null; }
+}
+
+export const validPlaceId = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{20,900}\.[A-Za-z0-9_-]{22}$/.test(id);
+
+export async function autocomplete(input, { bias } = {}) {
+  if (!placesConfigured()) throw fail('Address search is not set up yet.', 503);
+  const qs = new URLSearchParams({
+    key: KEY(), q: String(input).slice(0, 200), countrycodes: 'ng', limit: '6', dedupe: '1', normalizecity: '1', 'accept-language': 'en',
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) { console.error('[places] autocomplete', res.status, data?.error?.message); throw Object.assign(new Error('Address search is unavailable right now.'), { status: 502 }); }
-  return (data.suggestions || []).filter((s) => s.placePrediction).map(({ placePrediction: p }) => ({
-    placeId: p.placeId, main: p.structuredFormat?.mainText?.text || p.text?.text, secondary: p.structuredFormat?.secondaryText?.text || '', text: p.text?.text,
+  if (bias?.lat != null && bias?.lng != null) { // prefer results near the restaurant (about 40 km box); still allows farther matches
+    const d = 0.36; qs.set('viewbox', `${bias.lng - d},${bias.lat - d},${bias.lng + d},${bias.lat + d}`); qs.set('bounded', '0');
+  }
+  let res;
+  try { res = await fetch(`https://api.locationiq.com/v1/autocomplete?${qs}`, { signal: AbortSignal.timeout(8000) }); }
+  catch { throw fail('Address search is taking too long. Please try again.', 504); }
+  if (res.status === 404) return []; // LocationIQ says "Unable to geocode" when nothing matches
+  const data = await res.json().catch(() => null);
+  if (res.status === 429) throw fail('Address search is busy. Please try again in a moment.', 429);
+  if (!res.ok || !Array.isArray(data)) { console.error('[places] locationiq', res.status, data?.error || ''); throw fail('Address search is unavailable right now.', 502); }
+  return data.filter((x) => x.lat && x.lon && x.display_name).map((x) => ({
+    placeId: signPlace({ address: x.display_name, lat: Number(x.lat), lng: Number(x.lon) }),
+    main: x.display_place || x.display_name.split(',')[0], secondary: x.display_address || '', text: x.display_name,
   }));
 }
 
-const cache = new Map(); // placeId -> { at, value }; coordinates of a place don't change, so a short cache saves API calls
-export async function placeDetails(placeId, sessionToken) {
-  if (!KEY()) throw Object.assign(new Error('Address search is not set up yet.'), { status: 503 });
-  if (!validPlaceId(placeId)) throw Object.assign(new Error('Please pick an address from the list.'), { status: 400 });
-  const hit = cache.get(placeId);
-  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
-  const qs = sessionToken ? `?sessionToken=${encodeURIComponent(String(sessionToken).slice(0, 64))}` : '';
-  const res = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}${qs}`, {
-    headers: { 'X-Goog-Api-Key': KEY(), 'X-Goog-FieldMask': 'id,formattedAddress,location,displayName' },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.location) { console.error('[places] details', res.status, data?.error?.message); throw Object.assign(new Error('We could not find that address. Please pick another.'), { status: 400 }); }
-  const value = { placeId, address: data.formattedAddress || data.displayName?.text || '', lat: data.location.latitude, lng: data.location.longitude };
-  if (cache.size > 500) cache.clear();
-  cache.set(placeId, { at: Date.now(), value });
-  return value;
+/** Turns a placeId from one of our suggestions back into { address, lat, lng } after checking the signature. No network call. */
+export async function placeDetails(placeId) {
+  if (!placesConfigured()) throw fail('Address search is not set up yet.', 503);
+  const p = readPlace(placeId);
+  if (!p) throw fail('Please pick an address from the list.', 400);
+  return { placeId, address: p.a, lat: p.y, lng: p.x };
 }
 
 /** Straight-line distance in km (Haversine). */
@@ -64,7 +75,7 @@ export function radiusFee(radius, km) {
   return { ok: true, fee: Math.ceil(raw / 100 - 1e-9) * 100 };
 }
 
-/** Full quote for a customer's place. Coordinates are resolved on the server from the Google place id, never taken from the browser. */
+/** Full quote for a customer's place. Coordinates are resolved on the server from the signed place id, never taken from the browser. */
 export async function quoteDelivery(rest, placeId, sessionToken) {
   const f = rest.fulfillment;
   if (!f?.radius?.configured || f.location?.lat == null) throw Object.assign(new Error('Delivery is not set up for this restaurant.'), { status: 400 });
