@@ -1,10 +1,18 @@
-import { Order, OrderPayment, Restaurant, PaymentConfig, User } from '../models/index.js';
+import { Order, OrderPayment, Restaurant, PaymentConfig } from '../models/index.js';
 import { ps } from './paystack.js';
 import { sendEmail, btn } from './email.js';
 import { naira, randomToken } from '../utils/helpers.js';
 import { notifyRestaurant } from './notify.js';
 
 const audit = (order, by, field, from, to, note) => order.audit.push({ at: new Date(), by, field, from, to, note });
+
+// FIX: Paystack sometimes returns metadata as a JSON string instead of an object.
+// Always normalise it before reading fields from it.
+const parseMeta = (m) => {
+  if (!m) return {};
+  if (typeof m === 'string') { try { return JSON.parse(m) || {}; } catch { return {}; } }
+  return m;
+};
 
 /**
  * Start a Paystack payment for ONE food order.
@@ -56,12 +64,23 @@ export async function verifyOrderPayment(payment) {
 
   const order = await Order.findById(payment.order);
   if (!order) return { status: 'pending' };
-  const expected = Math.round(order.total * 100);
+  const expected = Math.round(Number(order.total) * 100);
+  const meta = parseMeta(t.metadata); // FIX: never read t.metadata directly
 
   if (t.status === 'success') {
-    if (t.amount !== expected || t.currency !== 'NGN' || t.metadata?.orderId !== String(order._id)) {
+    // FIX: numeric comparison on both sides; currency case-insensitive
+    const paidKobo = Math.round(Number(t.amount));
+    if (!Number.isFinite(paidKobo) || paidKobo !== expected || String(t.currency || '').toUpperCase() !== 'NGN') {
       await OrderPayment.updateOne({ _id: payment._id }, { status: 'failed', raw: { reason: 'mismatch', amount: t.amount, currency: t.currency } });
       return { status: 'failed', reason: 'mismatch' };
+    }
+    // FIX: the reference is already unique — a metadata-only mismatch must NOT fail a paid transaction.
+    // Log it and leave it pending so support/reconcile can review, instead of stranding the customer's money.
+    if (meta.orderId && String(meta.orderId) !== String(order._id)) {
+      console.error('[order verify] metadata orderId mismatch — left pending for review (payment PAID)', {
+        reference: payment.providerReference, metaOrderId: meta.orderId, orderId: String(order._id),
+      });
+      return { status: 'pending', message: 'Payment received; it is being reviewed before confirmation.' };
     }
     const claimed = await OrderPayment.findOneAndUpdate(
       { _id: payment._id, status: { $ne: 'success' } },
