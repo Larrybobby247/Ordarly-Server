@@ -52,9 +52,17 @@ subscriptionRouter.post('/verify', wrap(async (req, res) => {
 export async function verifySubscriptionPayment(payment) {
   if (payment.status === 'success') return { status: 'success' };
   const data = await ps(`/transaction/verify/${encodeURIComponent(payment.providerReference)}`);
-  if (!data.status) { // do not downgrade/fail on a lookup error, but DO tell the caller why (e.g. "Invalid key" means the wrong PAYSTACK_SECRET_KEY on the server)
-    console.error('[subscription verify]', payment.providerReference, data.message);
-    return { status: 'pending', message: `Paystack could not confirm this yet (${data.message || 'no reason given'}). We will keep checking.` };
+  if (!data.status) {
+  console.error('[subscription verify]', {
+    reference: payment.providerReference,
+    message: data.message,
+    status: data.status,
+  });
+
+  return {
+    status: 'pending',
+    message: `Paystack verification error: ${data.message || 'Unknown error'}`,
+  };
   }
   const t = data.data;
   if (t.status === 'success' && t.amount === payment.amount * 100 && t.currency === 'NGN') {
