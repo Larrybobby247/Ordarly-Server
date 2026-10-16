@@ -17,7 +17,9 @@ const ps = (path, opts = {}) => fetch(PS + path, {
 // FIX: same metadata normalisation as orderPayments — Paystack may return it as a JSON string.
 const parseMeta = (m) => {
   if (!m) return {};
-  if (typeof m === 'string') { try { return JSON.parse(m) || {}; } catch { return {}; } }
+  if (typeof m === 'string') {
+    try { return JSON.parse(m) || {}; } catch { return {}; }
+  }
   return m;
 };
 
@@ -26,7 +28,8 @@ subscriptionRouter.use(requireAuth, loadRestaurant);
 
 subscriptionRouter.get('/', wrap(async (req, res) => {
   const payments = await SubscriptionPayment.find({ restaurant: req.restaurant._id }).sort('-createdAt').limit(20).lean();
-  res.json({ subscription: req.subscription, isPro: req.isPro, price: req.planConfig.pro.priceNgn, payments });
+  const cfg = await getPlanConfig();
+  res.json({ subscription: req.subscription, isPro: req.isPro, price: cfg.pro.priceNgn, payments });
 }));
 
 subscriptionRouter.post('/checkout', wrap(async (req, res) => {
@@ -56,8 +59,12 @@ subscriptionRouter.post('/verify', wrap(async (req, res) => {
   if (!reference) return res.status(400).json({ error: 'Missing payment reference' });
   const payment = await SubscriptionPayment.findOne({ providerReference: String(reference), restaurant: req.restaurant._id });
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
-  try { res.json(await verifySubscriptionPayment(payment)); }
-  catch (e) { console.error('[subscription verify]', e); res.status(500).json({ error: 'Payment was found but we could not finish activating Pro. Please try "Check status" again in a moment.' }); }
+  try {
+    res.json(await verifySubscriptionPayment(payment));
+  } catch (e) {
+    console.error('[subscription verify]', e);
+    res.status(500).json({ error: 'Payment was found but we could not finish activating Pro. Please try "Check status" again in a moment.' });
+  }
 }));
 
 export async function verifySubscriptionPayment(payment) {
