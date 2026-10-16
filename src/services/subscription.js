@@ -57,6 +57,16 @@ export async function activateFromPayment(paymentDoc) {
     { status: 'success', verifiedAt: new Date() }, { new: true });
   if (!claimed) return null; // already processed (duplicate webhook)
 
+  try { return await finishActivation(claimed, cfg); }
+  catch (e) {
+    // Changed: if activation fails after we marked the payment successful, put it back to pending so the next check/webhook/cron retries it
+    // (before, the payment stayed "success" forever while Pro never turned on).
+    await SubscriptionPayment.updateOne({ _id: claimed._id }, { status: 'pending', $unset: { verifiedAt: 1 } });
+    throw e;
+  }
+}
+
+async function finishActivation(claimed, cfg) {
   const sub = await ensureSubscription(claimed.restaurant);
   const now = new Date();
   const base = isProActive(sub, now) && sub.status === 'active' && sub.periodEnd > now ? sub.periodEnd : now;
@@ -68,7 +78,8 @@ export async function activateFromPayment(paymentDoc) {
   await sub.save();
   await Restaurant.updateOne({ _id: claimed.restaurant }, { plan: 'pro' });
   const { r, u } = await ownerOf(claimed.restaurant);
-  await sendEmail({
+  // Changed: not awaited, so a slow email provider can't delay (or fail) turning Pro on.
+  sendEmail({
     to: u?.email, type: 'subscription_paid', restaurant: claimed.restaurant,
     dedupeKey: `sub_paid:${claimed.providerReference}`,
     subject: 'Pro subscription confirmed',
