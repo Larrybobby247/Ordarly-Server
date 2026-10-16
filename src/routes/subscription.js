@@ -8,9 +8,11 @@ import { activateFromPayment, ensureSubscription } from '../services/subscriptio
 import { getPlanConfig } from '../services/settings.js';
 
 const PS = 'https://api.paystack.co';
+// Changed: calls now time out after 12s and a network failure becomes a normal { status:false, message } result, so a slow or unreachable
+// Paystack can no longer hang the request or crash the route.
 const ps = (path, opts = {}) => fetch(PS + path, {
-  ...opts, headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json', ...(opts.headers || {}) },
-}).then((r) => r.json());
+  ...opts, signal: AbortSignal.timeout(12000), headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+}).then((r) => r.json()).catch((e) => ({ status: false, message: e.name === 'TimeoutError' ? 'Paystack took too long to respond.' : 'Could not reach Paystack.' }));
 
 export const subscriptionRouter = Router();
 subscriptionRouter.use(requireAuth, loadRestaurant);
@@ -43,13 +45,17 @@ subscriptionRouter.post('/checkout', wrap(async (req, res) => {
 subscriptionRouter.post('/verify', wrap(async (req, res) => {
   const payment = await SubscriptionPayment.findOne({ providerReference: String(req.body.reference), restaurant: req.restaurant._id });
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
-  res.json(await verifySubscriptionPayment(payment));
+  try { res.json(await verifySubscriptionPayment(payment)); }
+  catch (e) { console.error('[subscription verify]', e); res.status(500).json({ error: 'Payment was found but we could not finish activating Pro. Please try "Check status" again in a moment.' }); }
 }));
 
 export async function verifySubscriptionPayment(payment) {
   if (payment.status === 'success') return { status: 'success' };
   const data = await ps(`/transaction/verify/${encodeURIComponent(payment.providerReference)}`);
-  if (!data.status) return { status: 'pending', message: 'Could not verify yet. We will keep checking.' }; // do not downgrade/fail on a lookup error
+  if (!data.status) { // do not downgrade/fail on a lookup error, but DO tell the caller why (e.g. "Invalid key" means the wrong PAYSTACK_SECRET_KEY on the server)
+    console.error('[subscription verify]', payment.providerReference, data.message);
+    return { status: 'pending', message: `Paystack could not confirm this yet (${data.message || 'no reason given'}). We will keep checking.` };
+  }
   const t = data.data;
   if (t.status === 'success' && t.amount === payment.amount * 100 && t.currency === 'NGN') {
     await activateFromPayment(payment);
