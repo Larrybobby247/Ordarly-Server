@@ -53,21 +53,25 @@ export async function verifySubscriptionPayment(payment) {
   if (payment.status === 'success') return { status: 'success' };
   const data = await ps(`/transaction/verify/${encodeURIComponent(payment.providerReference)}`);
   if (!data.status) {
-  console.error('[subscription verify]', {
-    reference: payment.providerReference,
-    message: data.message,
-    status: data.status,
-  });
-
-  return {
-    status: 'pending',
-    message: `Paystack verification error: ${data.message || 'Unknown error'}`,
-  };
+    console.error('[subscription verify] Paystack lookup failed (left pending for retry)', {
+      reference: payment.providerReference, message: data.message,
+    });
+    return { status: 'pending', message: `Paystack verification error: ${data.message || 'Unknown error'}` };
   }
   const t = data.data;
-  if (t.status === 'success' && t.amount === payment.amount * 100 && t.currency === 'NGN') {
-    await activateFromPayment(payment);
-    return { status: 'success' };
+
+  if (t.status === 'success') {
+    const expectedKobo = Math.round(Number(payment.amount) * 100);
+    const belongsHere = !t.metadata?.restaurantId || String(t.metadata.restaurantId) === String(payment.restaurant);
+    if (t.amount === expectedKobo && t.currency === 'NGN' && belongsHere) {
+      await activateFromPayment(payment);
+      return { status: 'success' };
+    }
+    console.error('[subscription verify] PAID BUT MISMATCHED — marking failed (Pro NOT activated)', {
+      reference: payment.providerReference, expectedKobo, actualKobo: t.amount, currency: t.currency,
+    });
+    await SubscriptionPayment.updateOne({ _id: payment._id, status: { $ne: 'success' } }, { status: 'failed' });
+    return { status: 'failed', reason: 'mismatch', message: 'Paystack reports this payment as successful, but it does not match our records, so it was not applied. Contact support with your reference.' };
   }
   if (['failed', 'abandoned', 'reversed'].includes(t.status)) {
     await SubscriptionPayment.updateOne({ _id: payment._id, status: 'pending' }, { status: 'failed' });
@@ -75,6 +79,7 @@ export async function verifySubscriptionPayment(payment) {
   }
   return { status: 'pending' };
 }
+
 
 /** Paystack webhook. Mounted with express.raw BEFORE express.json. */
 export const webhookRouter = Router();
