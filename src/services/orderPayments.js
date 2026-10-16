@@ -58,7 +58,9 @@ export async function startOrderPayment(order, restaurant, callbackUrl) {
         metadata: { purpose: 'food_order', orderId: String(order._id), restaurantId: String(restaurant._id), orderRef: order.reference },
       },
     });
-    order.paymentStatus = 'pending'; audit(order, 'system', 'paymentStatus', 'awaiting_payment', 'pending', 'Paystack initialised'); await order.save();
+    order.paymentStatus = 'pending';
+    audit(order, 'system', 'paymentStatus', 'awaiting_payment', 'pending', 'Paystack initialised');
+    await order.save();
     return { authorizationUrl: data.authorization_url, reference };
   } catch (e) {
     await OrderPayment.updateOne({ _id: payment._id }, { status: 'failed' });
