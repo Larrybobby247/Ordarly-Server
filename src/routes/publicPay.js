@@ -36,8 +36,24 @@ r.post('/track/:token/verify-payment', wrap(async (req, res) => {
   if (!order) return res.status(404).json({ error: 'Order not found' });
   const payments = await OrderPayment.find({ order: order._id }).sort('-createdAt').limit(3);
   let result = { status: order.paymentStatus === 'paid' ? 'success' : 'pending' };
-  for (const p of payments) { const v = await verifyOrderPayment(p); if (v.status === 'success') { result = v; break; } result = v; }
-  res.json(result);
+let attention = null;
+
+for (const p of payments) {
+  const v = await verifyOrderPayment(p);
+
+  if (v.status === 'success') {
+    result = v;
+    attention = null;
+    break;
+  }
+
+  if (v.status === 'attention' && !attention) attention = v;
+  result = v;
+}
+
+if (attention) result = attention;
+res.json(result);
+
 }));
 
 /* Bank-transfer proof upload. NEVER marks the order paid. */
