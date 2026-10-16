@@ -120,7 +120,7 @@ r.get('/fulfillment', wrap(async (req, res) => {
   res.json({ fulfillment: f, deliveryReady: deliveryReady(f), mapsConfigured: placesConfigured() });
 }));
 
-// Address search for the restaurant's own address (all plans). Goes through our server, so the Google key never reaches the browser.
+// Address search for the restaurant's own address (all plans). Goes through our server, so the LocationIQ key never reaches the browser.
 r.post('/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional() })), wrap(async (req, res) => {
   res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken }) });
 }));

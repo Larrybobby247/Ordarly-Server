@@ -10,11 +10,40 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import { getPlanConfig, setPlanConfig, getPlatformSettings, setPlatformSettings } from '../services/settings.js';
 import { adminGrantPro, adminRevokePro } from '../services/subscription.js';
 import { sendEmail, btn, retryEmailById } from '../services/email.js';
+import { ps } from '../services/paystack.js';
 
 const r = Router();
 r.use(requireAuth, requireRole('admin'));
 // Any :id that is not a valid ObjectId is simply "not found" instead of a 500.
 r.param('id', (req, res, next, id) => (mongoose.isValidObjectId(id) ? next() : res.status(404).json({ error: 'Not found' })));
+
+/* ---------- System check: is this deployment wired up correctly? (admin only; never returns secrets) ---------- */
+r.get('/system-check', wrap(async (req, res) => {
+  const key = process.env.PAYSTACK_SECRET_KEY || '';
+  const mode = !key ? 'missing' : key.startsWith('sk_live_') ? 'live' : key.startsWith('sk_test_') ? 'test' : 'unknown';
+  const paystack = { mode, reachable: false, message: '' };
+  if (key) { try { await ps('/bank?country=nigeria&perPage=1'); paystack.reachable = true; } catch (e) { paystack.message = e.message; } }
+
+  // Subaccounts made with a TEST key do not exist under a LIVE key. Spot-check a few connected restaurants.
+  const sample = await PaymentConfig.find({ onboardingStatus: 'active', subaccountCode: { $exists: true } }).select('subaccountCode').limit(5).lean();
+  let subaccounts = { checked: 0, notFound: 0 };
+  if (key && paystack.reachable) {
+    const results = await Promise.all(sample.map((c) => ps(`/subaccount/${encodeURIComponent(c.subaccountCode)}`).then(() => true).catch(() => false)));
+    subaccounts = { checked: results.length, notFound: results.filter((x) => !x).length };
+  }
+  res.json({
+    nodeEnv: process.env.NODE_ENV || '(not set)',
+    database: mongoose.connection.readyState === 1,
+    clientUrl: process.env.CLIENT_URL || null,
+    requestHost: req.get('host'),
+    webhookUrl: `https://${req.get('host')}/api/webhooks/paystack`,
+    paystack, subaccounts,
+    configured: {
+      jwtSecret: !!process.env.JWT_SECRET, email: !!process.env.RESEND_API_KEY, addressSearch: !!process.env.LOCATIONIQ_API_KEY,
+      pushNotifications: !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY),
+    },
+  });
+}));
 
 const audit = (req, action, target, detail) =>
   AuditLog.create({ actor: req.user._id, action, target: String(target), detail }).catch(() => {});

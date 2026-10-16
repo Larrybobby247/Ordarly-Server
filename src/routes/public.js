@@ -188,7 +188,7 @@ function waResponse(rest, order) {
 /* ---------- PRO: checkout ---------- */
 const quoteSchema = z.object({ placeId: z.string().max(2000), sessionToken: z.string().max(64).optional() });
 
-// Address suggestions for the delivery box, biased towards the restaurant. Goes through our server, so no Google key in the browser.
+// Address suggestions for the delivery box, biased towards the restaurant. Goes through our server, so no map key in the browser.
 r.post('/r/:slug/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional() })), wrap(async (req, res) => {
   const found = await findRestaurant(req.params.slug);
   if (!found?.isPro) return res.status(404).json({ error: 'Not found' });
@@ -210,7 +210,7 @@ const checkoutSchema = z.object({
   cart: cartSchema,
   customerName: z.string().min(2).max(80), customerEmail: z.string().email(), customerPhone: z.string().min(10).max(20),
   fulfillment: z.enum(['delivery', 'pickup', 'dine_in']),
-  deliveryPlaceId: z.string().max(300).optional(), deliveryAddress: z.string().max(300).optional(), tableNumber: z.string().max(20).optional(),
+  deliveryPlaceId: z.string().max(1000).optional(), deliveryAddress: z.string().max(300).optional(), tableNumber: z.string().max(20).optional(),
   paymentMethod: z.enum(['paystack', 'bank_transfer', 'pod']),
   notes: z.string().max(300).optional(), idempotencyKey: z.string().max(80).optional(),
   confirmed: z.literal(true, { errorMap: () => ({ message: 'Please confirm your order' }) }),
