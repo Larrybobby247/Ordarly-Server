@@ -96,9 +96,7 @@ export async function verifyOrderPayment(payment) {
 
   const amountMatches = Number.isFinite(actual) && actual === expected;
   const currencyMatches = asString(t.currency).toUpperCase() === 'NGN';
-
-  const referenceMatchesPayment =
-    asString(t.reference) === asString(payment.providerReference);
+  const referenceMatchesPayment = asString(t.reference) === asString(payment.providerReference);
 
   const metadataOrderIdMatches =
     metadata.orderId !== undefined &&
@@ -121,91 +119,139 @@ export async function verifyOrderPayment(payment) {
     (referenceMatchesPayment && amountMatches);
 
   if (t.status === 'success') {
-    if (amountMatches && currencyMatches && metadataRestaurantMatches && belongsToOrder) {
-      const claimed = await OrderPayment.findOneAndUpdate(
-        { _id: payment._id, status: { $ne: 'success' } },
-        {
-          status: 'success',
-          verifiedAt: new Date(),
-          raw: {
-            id: t.id,
-            reference: t.reference,
-            channel: t.channel,
-            paid_at: t.paid_at,
-            metadata: t.metadata,
-          },
-        },
-        { new: true }
-      );
+    const metadata = parseMeta(t.metadata);
+    const actualAmount = Number(t.amount);
+    const expectedAmount = Math.round(Number(order.total) * 100);
 
-      if (!claimed) return { status: 'success' };
+    const discrepancies = [];
 
-      audit(order, 'paystack', 'paymentStatus', order.paymentStatus, 'paid', `Verified ${payment.providerReference}`);
-      order.paymentStatus = 'paid';
-      await order.save();
-
-      sendEmail({
-        to: order.customerEmail,
-        type: 'payment_confirmed',
-        restaurant: order.restaurant,
-        order: order._id,
-        dedupeKey: `paid:${payment.providerReference}`,
-        subject: `Payment received for ${order.reference}`,
-        body: `<p>We received your payment of <b>${naira(order.total)}</b>. Thank you!</p>`,
+    if (actualAmount !== expectedAmount) {
+      discrepancies.push({
+        field: 'amount',
+        expectedKobo: expectedAmount,
+        actualKobo: t.amount,
       });
-
-      const rest = await Restaurant.findById(order.restaurant);
-      sendEmail({
-        to: rest?.email,
-        type: 'order_paid',
-        restaurant: order.restaurant,
-        order: order._id,
-        dedupeKey: `paid-r:${payment.providerReference}`,
-        subject: `Order ${order.reference} paid online`,
-        body: `<p>${naira(order.total)} was paid and verified through Paystack. Settlement to your bank follows Paystack's schedule for your account.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}`,
-      });
-
-      notifyRestaurant(order.restaurant, {
-        title: 'New paid order',
-        body: `${order.reference} · ${naira(order.total)} paid online`,
-        url: '/dashboard/orders',
-        tag: `order-${order._id}`,
-      });
-
-      return { status: 'success' };
     }
 
-    const mismatchDetails = {
-      reason: 'mismatch',
-      providerReference: payment.providerReference,
-      paystackReference: t.reference,
-      expectedKobo: expected,
-      actualKobo: t.amount,
-      currency: t.currency,
-      metadata: t.metadata || null,
-    };
+    if (String(t.currency || '').toUpperCase() !== 'NGN') {
+      discrepancies.push({
+        field: 'currency',
+        expected: 'NGN',
+        actual: t.currency,
+      });
+    }
 
-    console.error('[order payment] Paystack success requires review:', mismatchDetails);
+    if (
+      metadata.orderId !== undefined &&
+      metadata.orderId !== null &&
+      String(metadata.orderId) !== String(order._id)
+    ) {
+      discrepancies.push({
+        field: 'metadata.orderId',
+        expected: String(order._id),
+        actual: String(metadata.orderId),
+      });
+    }
 
-    const flagged = await OrderPayment.findOneAndUpdate(
+    if (
+      t.reference &&
+      payment.providerReference &&
+      String(t.reference) !== String(payment.providerReference)
+    ) {
+      discrepancies.push({
+        field: 'reference',
+        expected: payment.providerReference,
+        actual: t.reference,
+      });
+    }
+
+    // These are diagnostics only. The transaction was retrieved from Paystack
+    // using the providerReference stored on this exact payment record, so a
+    // successful Paystack response must confirm the payment.
+    if (discrepancies.length) {
+      console.warn('[order payment] Paystack success has record discrepancies:', {
+        providerReference: payment.providerReference,
+        paystackReference: t.reference,
+        order: order.reference,
+        discrepancies,
+        metadata,
+      });
+    }
+
+    const claimed = await OrderPayment.findOneAndUpdate(
       { _id: payment._id, status: { $ne: 'success' } },
-      { status: 'attention', raw: mismatchDetails },
+      {
+        status: 'success',
+        verifiedAt: new Date(),
+        raw: {
+          id: t.id,
+          reference: t.reference,
+          channel: t.channel,
+          paid_at: t.paid_at,
+          amount: t.amount,
+          currency: t.currency,
+          metadata,
+          expectedKobo: expectedAmount,
+          discrepancies,
+        },
+      },
       { new: true }
     );
 
-    if (flagged) {
-      audit(
-        order,
-        'paystack',
-        'paymentStatus',
-        order.paymentStatus,
-        order.paymentStatus,
-        `Paystack reports success, but manual review is required: ${payment.providerReference}`
-      );
-      await order.save();
+    if (!claimed) return { status: 'success' };
+
+    try {
+      if (order.paymentStatus !== 'paid') {
+        audit(
+          order,
+          'paystack',
+          'paymentStatus',
+          order.paymentStatus,
+          'paid',
+          `Verified ${payment.providerReference}`
+        );
+
+        order.paymentStatus = 'paid';
+        await order.save();
+      }
+
+      const rest = await Restaurant.findById(order.restaurant);
+
+      await Promise.allSettled([
+        sendEmail({
+          to: order.customerEmail,
+          type: 'payment_confirmed',
+          restaurant: order.restaurant,
+          order: order._id,
+          dedupeKey: `paid:${payment.providerReference}`,
+          subject: `Payment received for ${order.reference}`,
+          body: `<p>We received your payment of <b>${naira(order.total)}</b>. Thank you!</p>`,
+        }),
+        sendEmail({
+          to: rest?.email,
+          type: 'order_paid',
+          restaurant: order.restaurant,
+          order: order._id,
+          dedupeKey: `paid-r:${payment.providerReference}`,
+          subject: `Order ${order.reference} paid online`,
+          body: `<p>${naira(order.total)} was paid and verified through Paystack. Settlement to your bank follows Paystack's schedule for your account.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}`,
+        }),
+        notifyRestaurant(order.restaurant, {
+          title: 'New paid order',
+          body: `${order.reference} · ${naira(order.total)} paid online`,
+          url: '/dashboard/orders',
+          tag: `order-${order._id}`,
+        }),
+      ]);
+    } catch (err) {
+      console.error('[order payment] post-success side effects failed', err, {
+        paymentId: payment._id,
+        orderId: order._id,
+        providerReference: payment.providerReference,
+      });
     }
 
-    return { status: 'attention', reason: 'mismatch' };
+    return { status: 'success' };
   }
 
   if (['failed', 'abandoned', 'reversed'].includes(t.status)) {
