@@ -48,28 +48,72 @@ export async function startTrial(restaurantId) {
   return sub;
 }
 
-/** Called ONLY after server-side Paystack verification. Idempotent per payment reference. */
+/** Called ONLY after server-side Paystack verification. Idempotent per payment reference.
+ *  Accepts either a pending paymentDoc (will try to claim) OR an already-claimed document.
+ */
 export async function activateFromPayment(paymentDoc) {
   const cfg = await getPlanConfig();
+
+  // If caller passed an already-claimed/success doc, proceed to finish activation.
+  if (paymentDoc && paymentDoc.status === 'success') {
+    try {
+      return await finishActivation(paymentDoc, cfg);
+    } catch (e) {
+      // Record activation error but keep payment success so webhook/client isn't affected.
+      console.error('[subscription] finishActivation failed for already-claimed payment', { paymentId: paymentDoc._id, err: e });
+      try {
+        await SubscriptionPayment.updateOne(
+          { _id: paymentDoc._id },
+          { $set: { activationError: e?.message || String(e), activationErrorAt: new Date() } }
+        );
+      } catch (uerr) {
+        console.error('[subscription] failed to persist activation error', uerr);
+      }
+      return paymentDoc;
+    }
+  }
+
   // Atomic claim: only the first caller flips pending -> success
   const claimed = await SubscriptionPayment.findOneAndUpdate(
     { _id: paymentDoc._id, status: { $ne: 'success' } },
-    { status: 'success', verifiedAt: new Date() }, { new: true });
-  if (!claimed) return null; // already processed (duplicate webhook)
+    { status: 'success', verifiedAt: new Date() }, { new: true }
+  );
+  if (!claimed) {
+    // Already processed concurrently by another worker; try to load that version and finish activation
+    const existing = await SubscriptionPayment.findById(paymentDoc._id).lean();
+    if (existing && existing.status === 'success') {
+      try {
+        return await finishActivation(existing, cfg);
+      } catch (e) {
+        console.error('[subscription] finishActivation failed for concurrently-claimed payment', { paymentId: paymentDoc._id, err: e });
+        try {
+          await SubscriptionPayment.updateOne(
+            { _id: paymentDoc._id },
+            { $set: { activationError: e?.message || String(e), activationErrorAt: new Date() } }
+          );
+        } catch (uerr) {
+          console.error('[subscription] failed to persist activation error', uerr);
+        }
+        return existing;
+      }
+    }
+    return null; // nothing to do
+  }
 
+  // We have claimed the payment; try to finish activation.
   try {
-    // Try to finish activation, but DO NOT revert the payment status if activation fails.
-    // Activation is important but must not make the webhook/backend fail when Paystack reports success.
     return await finishActivation(claimed, cfg);
   } catch (e) {
-    // Log and record the activation error on the payment for later reconciliation, but keep payment marked success.
+    // Do NOT revert payment to pending. Record activation error and keep payment marked success.
     console.error('[subscription] activation failed after payment marked success', { paymentId: claimed._id, err: e });
     try {
-      await SubscriptionPayment.updateOne({ _id: claimed._id }, { $set: { activationError: e?.message || String(e), activationErrorAt: new Date() } });
+      await SubscriptionPayment.updateOne(
+        { _id: claimed._id },
+        { $set: { activationError: e?.message || String(e), activationErrorAt: new Date() } }
+      );
     } catch (uerr) {
       console.error('[subscription] failed to record activation error on payment', uerr);
     }
-    // Return the claimed document so callers know the payment is claimed. Activation may be retried by cron/reconcile.
     return claimed;
   }
 }
