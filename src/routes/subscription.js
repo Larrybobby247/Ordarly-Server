@@ -122,40 +122,68 @@ export async function verifySubscriptionPayment(payment) {
     const amountOk = Number.isFinite(paidKobo) && paidKobo === expectedKobo;
     const currencyOk = String(t.currency || '').toUpperCase() === 'NGN';
 
-    if (amountOk && currencyOk && belongsHere) {
-      await activateFromPayment(payment);
+    // Build diagnostics like we do for order payments
+    const discrepancies = [];
+    if (paidKobo !== expectedKobo) {
+      discrepancies.push({ field: 'amount', expectedKobo, actualKobo: t.amount });
+    }
+    if (!currencyOk) {
+      discrepancies.push({ field: 'currency', expected: 'NGN', actual: t.currency });
+    }
+    if (meta.restaurantId !== undefined && meta.restaurantId !== null && String(meta.restaurantId) !== String(payment.restaurant)) {
+      discrepancies.push({ field: 'metadata.restaurantId', expected: String(payment.restaurant), actual: String(meta.restaurantId) });
+    }
+    if (t.reference && payment.providerReference && String(t.reference) !== String(payment.providerReference)) {
+      discrepancies.push({ field: 'reference', expected: payment.providerReference, actual: t.reference });
+    }
+
+    if (discrepancies.length) {
+      console.warn('[subscription verify] Paystack success has record discrepancies:', {
+        providerReference: payment.providerReference,
+        paystackReference: t.reference,
+        discrepancies,
+        metadata: t.metadata,
+      });
+    }
+
+    // Claim the payment atomically and record raw payload + discrepancies.
+    const claimed = await SubscriptionPayment.findOneAndUpdate(
+      { _id: payment._id, status: { $ne: 'success' } },
+      {
+        status: 'success',
+        verifiedAt: new Date(),
+        raw: {
+          id: t.id,
+          reference: t.reference,
+          paid_at: t.paid_at,
+          amount: t.amount,
+          currency: t.currency,
+          metadata: t.metadata,
+          expectedKobo,
+          discrepancies,
+        },
+      },
+      { new: true }
+    );
+
+    // If another worker already processed it, treat as success.
+    if (!claimed) return { status: 'success' };
+
+    // Try to activate subscription. Activation errors must not make paystack/webhook fail.
+    try {
+      // activateFromPayment will perform its own claim if needed and then finish activation.
+      await activateFromPayment(payment).catch((e) => {
+        console.error('[subscription verify] activateFromPayment failed (record kept success)', { paymentId: payment._id, err: e });
+      });
+
+      // Optionally update the payment raw again with activation status if needed.
       const fresh = await SubscriptionPayment.findById(payment._id).lean();
       return { status: fresh?.status === 'success' ? 'success' : 'pending' };
+    } catch (e) {
+      // Should not happen because activateFromPayment catches; but guard anyway.
+      console.error('[subscription verify] unexpected activation error', e);
+      return { status: 'success' }; // Payment is claimed; do not surface error to caller/provider.
     }
-
-    if (!amountOk || !currencyOk) {
-      console.error('[subscription verify] PAID BUT MISMATCHED — marking failed (Pro NOT activated)', {
-        reference: payment.providerReference,
-        expectedKobo,
-        actualKobo: t.amount,
-        currency: t.currency,
-      });
-      await SubscriptionPayment.updateOne(
-        { _id: payment._id, status: { $ne: 'success' } },
-        { status: 'failed' }
-      );
-      return {
-        status: 'failed',
-        reason: 'mismatch',
-        message: 'Paystack reports this payment as successful, but it does not match our records, so it was not applied.',
-      };
-    }
-
-    console.error('[subscription verify] metadata mismatch — left pending for review (payment PAID)', {
-      reference: payment.providerReference,
-      metaRestaurantId: meta.restaurantId,
-      restaurant: String(payment.restaurant),
-    });
-
-    return {
-      status: 'pending',
-      message: 'Payment received; it is being reviewed before Pro is activated.',
-    };
   }
 
   if (['failed', 'abandoned', 'reversed'].includes(t.status)) {
