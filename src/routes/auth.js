@@ -76,7 +76,16 @@ r.post('/login', validate(z.object({ email: z.string().email(), password: z.stri
   res.json({ ok: true, role: user.role });
 }));
 
-r.post('/logout', (req, res) => { res.clearCookie(COOKIE); res.json({ ok: true }); });
+r.post('/logout', (req, res) => {
+  res.clearCookie(COOKIE, {
+    httpOnly: true,
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    path: '/',
+  });
+
+  return res.status(200).json({ ok: true });
+});
 
 r.post('/forgot-password', validate(z.object({ email: z.string().email() })), wrap(async (req, res) => {
   const user = await User.findOne({ email: req.body.email.toLowerCase() });
