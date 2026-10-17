@@ -166,24 +166,26 @@ export async function verifySubscriptionPayment(payment) {
       { new: true }
     );
 
-    // If another worker already processed it, treat as success.
-    if (!claimed) return { status: 'success' };
-
-    // Try to activate subscription. Activation errors must not make paystack/webhook fail.
-    try {
-      // activateFromPayment will perform its own claim if needed and then finish activation.
-      await activateFromPayment(payment).catch((e) => {
-        console.error('[subscription verify] activateFromPayment failed (record kept success)', { paymentId: payment._id, err: e });
-      });
-
-      // Optionally update the payment raw again with activation status if needed.
-      const fresh = await SubscriptionPayment.findById(payment._id).lean();
-      return { status: fresh?.status === 'success' ? 'success' : 'pending' };
-    } catch (e) {
-      // Should not happen because activateFromPayment catches; but guard anyway.
-      console.error('[subscription verify] unexpected activation error', e);
-      return { status: 'success' }; // Payment is claimed; do not surface error to caller/provider.
+    // If another worker already processed it, claimed will be null
+    if (!claimed) {
+      // Another worker marked success; try to activate based on the stored doc
+      const existing = await SubscriptionPayment.findById(payment._id).lean();
+      if (existing && existing.status === 'success') {
+        // ensure activation runs for already-claimed payments
+        await activateFromPayment(existing).catch((e) => {
+          console.error('[subscription verify] activateFromPayment failed for existing claimed payment', { paymentId: payment._id, err: e });
+        });
+      }
+      return { status: 'success' };
     }
+
+    // We have the claimed doc; attempt activation but do not let activation errors fail the webhook/response.
+    await activateFromPayment(claimed).catch((e) => {
+      console.error('[subscription verify] activateFromPayment failed (record kept success)', { paymentId: claimed._id, err: e });
+    });
+
+    const fresh = await SubscriptionPayment.findById(payment._id).lean();
+    return { status: fresh?.status === 'success' ? 'success' : 'pending' };
   }
 
   if (['failed', 'abandoned', 'reversed'].includes(t.status)) {
