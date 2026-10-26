@@ -43,7 +43,25 @@ app.use('/api/webhooks', webhookRouter);
 
 // Custom domains are served by the same frontend, so allow any origin that is the main client
 // or a verified custom domain (checked dynamically).
-app.use(cors({ origin: (o, cb) => cb(null, !o || o === process.env.CLIENT_URL || /^https:\/\//.test(o)), credentials: true }));
+
+const allowedOrigins = new Set([
+  'https://ordarly.com.ng',
+  'https://www.ordarly.com.ng',
+  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL.replace(/\/$/, '')] : []),
+]);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests without an Origin header, such as server-to-server calls.
+    if (!origin || allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  credentials: true,
+}));
+
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
