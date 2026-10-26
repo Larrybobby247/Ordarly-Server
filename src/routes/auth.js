@@ -79,7 +79,7 @@ r.post('/login', validate(z.object({ email: z.string().email(), password: z.stri
 r.post('/logout', (req, res) => {
   res.clearCookie(COOKIE, {
     httpOnly: true,
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    sameSite: process.env.NODE_ENV === 'production' ? 'lax' : 'lax',
     secure: process.env.NODE_ENV === 'production',
     path: '/',
   });
