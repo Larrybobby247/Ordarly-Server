@@ -12,7 +12,7 @@ export function signSession(user) {
 export function setSessionCookie(res, token) {
   res.cookie(COOKIE, token, {
     httpOnly: true,
-    sameSite: process.env.NODE_ENV === 'production' ? 'lax' : 'lax',
+    sameSite: 'lax' 
     secure: process.env.NODE_ENV === 'production',
     path: '/',
     maxAge: 7 * 86400000,
