@@ -124,7 +124,8 @@ async function finishActivation(claimed, cfg) {
   const base = isProActive(sub, now) && sub.status === 'active' && sub.periodEnd > now ? sub.periodEnd : now;
   sub.plan = 'pro'; sub.status = 'active';
   sub.periodStart = sub.periodStart && base > now ? sub.periodStart : now;
-  sub.periodEnd = new Date(+base + cfg.pro.periodDays * DAY);
+  // Length of access was fixed when the payment was created (30 days monthly, 365 yearly); older payments fall back to the monthly length.
+  sub.periodEnd = new Date(+base + (claimed.periodDays || cfg.pro.periodDays) * DAY);
   sub.lastPaymentReference = claimed.providerReference;
   sub.remindersSent = {};
   await sub.save();
@@ -135,7 +136,7 @@ async function finishActivation(claimed, cfg) {
     to: u?.email, type: 'subscription_paid', restaurant: claimed.restaurant,
     dedupeKey: `sub_paid:${claimed.providerReference}`,
     subject: 'Pro subscription confirmed',
-    body: `<p>Payment received for <b>${r?.name}</b>. Pro is active until ${sub.periodEnd.toDateString()}.</p>`,
+    body: `<p>Payment received for <b>${r?.name}</b>${claimed.interval === 'yearly' ? ' (yearly plan)' : ''}. Pro is active until ${sub.periodEnd.toDateString()}.</p>`,
   }).catch((e) => console.error('[subscription] sendEmail failed', e));
   return sub;
 }
