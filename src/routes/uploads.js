@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
+import { Restaurant } from '../models/index.js';
 import multer from 'multer';
 import { wrap } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant } from '../middleware/auth.js';
@@ -8,7 +10,15 @@ const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
 
 // Public-facing images only (logo, cover, meal photos). Payment proofs use a separate private path.
-r.post('/image', requireAuth, loadRestaurant, upload.single('image'), wrap(async (req, res) => {
+// Owners upload into their own folder. An ADMIN adding meals for a restaurant passes ?restaurant=<id> (admins only; ignored for owners).
+const target = async (req, res, next) => {
+  if (req.user?.role === 'admin' && req.query.restaurant) {
+    if (!mongoose.isValidObjectId(req.query.restaurant) || !(await Restaurant.exists({ _id: req.query.restaurant }))) return res.status(404).json({ error: 'Restaurant not found' });
+    req.restaurant = { _id: req.query.restaurant }; return next();
+  }
+  return loadRestaurant(req, res, next);
+};
+r.post('/image', requireAuth, target, upload.single('image'), wrap(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose an image (JPG, PNG or WebP, max 5 MB).' });
   const kind = sniffImage(req.file.buffer);
   if (!kind) return res.status(400).json({ error: 'Only JPG, PNG or WebP images are accepted.' });

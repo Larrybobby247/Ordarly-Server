@@ -11,6 +11,9 @@ import { getPlanConfig, setPlanConfig, getPlatformSettings, setPlatformSettings 
 import { adminGrantPro, adminRevokePro } from '../services/subscription.js';
 import { sendEmail, btn, retryEmailById } from '../services/email.js';
 import { ps } from '../services/paystack.js';
+import { menuRouter } from './menu.js';
+import { clearCacheOnWrite } from '../services/publicCache.js';
+import { isProActive } from '../services/subscription.js';
 
 const r = Router();
 r.use(requireAuth, requireRole('admin'));
@@ -243,6 +246,28 @@ r.get('/restaurants/:id', wrap(async (req, res) => {
     paystackStatus: payCfg?.onboardingStatus || 'not_configured', recentOrders: recent,
   });
 }));
+
+/* ================= Menu management on behalf of a restaurant =================
+ * Admins can add and edit meals for any restaurant they pick. This re-uses the exact router the owners use (same validation,
+ * sizes, add-ons and Free-plan meal limit), pointed at the selected restaurant instead of the caller's own. Every change is audited. */
+async function adminTenant(req, res, next) {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Restaurant not found' });
+    const rest = await Restaurant.findById(req.params.id);
+    if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
+    const sub = await Subscription.findOne({ restaurant: rest._id });
+    req.restaurant = rest; req.subscription = sub; req.isPro = isProActive(sub); req.planConfig = await getPlanConfig();
+    next();
+  } catch (e) { next(e); }
+}
+const auditMenuWrites = (req, res, next) => {
+  if (req.method !== 'GET') res.on('finish', () => { if (res.statusCode < 400) audit(req, 'admin_menu_edit', req.params.id, { method: req.method, path: req.path, name: req.body?.name }); });
+  next();
+};
+r.get('/restaurants/:id/menu-info', adminTenant, wrap(async (req, res) => {
+  res.json({ restaurant: { _id: req.restaurant._id, name: req.restaurant.name, slug: req.restaurant.slug, plan: req.isPro ? 'pro' : 'free', status: req.restaurant.status } });
+}));
+r.use('/restaurants/:id/menu', adminTenant, clearCacheOnWrite, auditMenuWrites, menuRouter());
 
 r.post('/restaurants/:id/suspend', validate(z.object({ reason: z.string().min(3).max(300) })), wrap(async (req, res) => {
   const rest = await Restaurant.findByIdAndUpdate(req.params.id, { status: 'suspended', suspendReason: req.body.reason }, { new: true });
