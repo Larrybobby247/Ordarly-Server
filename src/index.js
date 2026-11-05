@@ -26,11 +26,13 @@ import { sendEmail } from './services/email.js';
 import { runSubscriptionSweep } from './services/subscription.js';
 import { retryFailedEmails } from './services/email.js';
 import { getPlanConfig } from './services/settings.js';
+import { isAllowedCustomOrigin, runDomainWorker, migrateLegacyDomains } from './services/customDomain.js';
+import { platformHosts } from './services/domainUtils.js';
 
 for (const k of ['MONGODB_URI', 'JWT_SECRET', 'CLIENT_URL']) if (!process.env[k]) { console.error(`Missing env ${k}`); process.exit(1); }
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', 1); // Render puts exactly one proxy in front of the app; this makes req.ip (rate limits) the real client IP and not a spoofable header
 app.use(helmet());
 
 // PERF (new): gzip/brotli-style compression for JSON responses (menus, order lists, admin tables), typically 70-90% smaller on the wire.
@@ -41,25 +43,24 @@ catch { console.warn('[perf] compression not installed (run npm install in serve
 // Webhooks need the raw body, so mount before express.json
 app.use('/api/webhooks', webhookRouter);
 
-// Custom domains are served by the same frontend, so allow any origin that is the main client
-// or a verified custom domain (checked dynamically).
-
-const allowedOrigins = new Set([
+// CORS. Custom domains are served by the same frontend, so the browser calls this API from the restaurant's own domain.
+//  - Ordarly's own frontend origins: allowed for every route (cookies/auth unchanged).
+//  - A restaurant's custom domain: allowed ONLY if it is https, exactly matches an ACTIVE domain of a Pro, non-suspended restaurant,
+//    and ONLY for the public ordering API (/api/public/*). Owner and admin routes are never reachable from a customer domain.
+//  - Anything else gets no CORS headers (the browser blocks it). No wildcard, no thrown error, so rejected origins don't pollute the error log.
+const officialOrigins = new Set([
   'https://ordarly.com.ng',
   'https://www.ordarly.com.ng',
+  ...[...platformHosts()].map((h) => `https://${h}`),
   ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL.replace(/\/$/, '')] : []),
 ]);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests without an Origin header, such as server-to-server calls.
-    if (!origin || allowedOrigins.has(origin)) {
-      return callback(null, true);
-    }
-
-    return callback(new Error('Origin not allowed by CORS'));
-  },
-  credentials: true,
+app.use(cors((req, callback) => {
+  const origin = req.get('origin');
+  const base = { credentials: true, maxAge: 600 };
+  if (!origin || officialOrigins.has(origin)) return callback(null, { ...base, origin: true });
+  if (!req.path.startsWith('/api/public/')) return callback(null, { ...base, origin: false });
+  isAllowedCustomOrigin(origin).then((ok) => callback(null, { ...base, origin: ok })).catch(() => callback(null, { ...base, origin: false }));
 }));
 
 app.use(express.json({ limit: '1mb' }));
@@ -78,6 +79,10 @@ app.use('/api/public/places', limiter(40));
 app.use('/api/public/track/:token/proof', limiter(10));
 app.use('/api/public/track/:token/pay', limiter(20));
 app.use('/api/uploads', limiter(60));
+// Custom domains: registering touches the Vercel API and DNS checks hit resolvers, so both are tightly limited per IP.
+app.use('/api/restaurant/custom-domain/verify', limiter(30, 10 * 60 * 1000));
+const domainWrites = limiter(12, 60 * 60 * 1000); // created ONCE so its counters persist between requests
+app.use('/api/restaurant/custom-domain', (req, res, next) => (['PUT', 'DELETE'].includes(req.method) ? domainWrites(req, res, next) : next()));
 app.use('/api/public/complaints', limiter(8, 60 * 60 * 1000));
 app.use('/api/public/contact', limiter(10, 60 * 60 * 1000));
 
@@ -120,6 +125,10 @@ await getPlanConfig();
 // Subscription sweep every 10 min, email retries every 5 min (server-side timestamps, UTC)
 cron.schedule('*/10 * * * *', () => runSubscriptionSweep().catch((e) => console.error('[sweep]', e)));
 cron.schedule('*/5 * * * *', () => retryFailedEmails().catch((e) => console.error('[email retry]', e)));
+
+// Custom-domain verification: every minute, but each domain is only touched when ITS next check is due (30s -> 2h back-off), in small batches.
+cron.schedule('* * * * *', () => runDomainWorker().catch((e) => console.error('[domains]', e)));
+migrateLegacyDomains().catch((e) => console.error('[domains] legacy migration', e));
 
 cron.schedule('*/5 * * * *', () => reconcilePayments().catch((e) => console.error('[reconcile]', e)));
 
