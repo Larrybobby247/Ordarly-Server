@@ -7,6 +7,7 @@ import { startOrderPayment, verifyOrderPayment } from '../services/orderPayments
 import { sniffImage, saveProof } from '../services/storage.js';
 import { sendEmail, btn } from '../services/email.js';
 import { notifyRestaurant } from '../services/notify.js';
+import { publicBaseFor } from '../services/customDomain.js';
 
 const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
@@ -25,7 +26,7 @@ r.post('/track/:token/pay', wrap(async (req, res) => {
   if (!isProActive(sub))
     return res.status(409).json({ error: 'Online payment is not available for this restaurant right now.' });
   try {
-    const out = await startOrderPayment(order, rest, `${process.env.CLIENT_URL}/track/${req.params.token}?pay=1`);
+    const out = await startOrderPayment(order, rest, `${await publicBaseFor(req, rest, true)}/track/${req.params.token}?pay=1`);
     res.json(out);
   } catch (e) { res.status(e.status || 502).json({ error: e.message }); }
 }));

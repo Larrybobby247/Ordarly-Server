@@ -1,12 +1,13 @@
 import { Router } from 'express';
-import dns from 'dns/promises';
 import { Restaurant, Category, Meal, PaymentConfig, Order } from '../models/index.js';
-import { z, validate, wrap, normalisePhone, validWhatsapp, slugify, randomToken } from '../utils/helpers.js';
+import { z, validate, wrap, normalisePhone, validWhatsapp, slugify } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant, requirePro } from '../middleware/auth.js';
 import { clearCacheOnWrite } from '../services/publicCache.js';
 import { RESERVED_SLUGS, NIGERIAN_STATES } from '../config/plans.js';
 import { startTrial } from '../services/subscription.js';
 import { autocomplete, placeDetails, placesConfigured } from '../services/places.js';
+import { registerDomain, checkNow, disconnectDomain, domainView, DomainError } from '../services/customDomain.js';
+import { vercelConfigured } from '../services/vercel.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant);
@@ -31,7 +32,7 @@ r.get('/', wrap(async (req, res) => {
   res.json({
     restaurant: req.restaurant, isPro: req.isPro, subscription: req.subscription,
     plan: { maxActiveMeals: req.isPro ? null : req.planConfig.free.maxActiveMeals, proPrice: req.planConfig.pro.priceNgn },
-    publicUrl: req.restaurant.customDomainStatus === 'verified' && req.isPro
+    publicUrl: req.isPro && req.restaurant.customDomain && (req.restaurant.customDomainStatus === 'active' || (req.restaurant.customDomainStatus === 'verified' && req.restaurant.customDomainMeta?.legacy))
       ? `https://${req.restaurant.customDomain}` : `${origin}/${req.restaurant.slug}`,
   });
 }));
@@ -64,52 +65,34 @@ r.post('/trial', wrap(async (req, res) => {
   res.json({ subscription: sub });
 }));
 
-/* ---------- Custom domain (Pro) ---------- */
-const DOMAIN_RE = /^(?!-)([a-z0-9-]{1,63}\.)+[a-z]{2,24}$/;
-r.put('/custom-domain', requirePro('Custom domain'), validate(z.object({ domain: z.string().min(4).max(253) })), wrap(async (req, res) => {
-  const domain = req.body.domain.toLowerCase().trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-  if (!DOMAIN_RE.test(domain)) return res.status(400).json({ error: 'Enter a valid domain, e.g. order.myrestaurant.com' });
-  if (domain === process.env.PLATFORM_DOMAIN || domain.endsWith('.' + process.env.PLATFORM_DOMAIN)) return res.status(400).json({ error: 'That domain is reserved' });
-  if (await Restaurant.exists({ customDomain: domain, _id: { $ne: req.restaurant._id } })) return res.status(409).json({ error: 'Domain already in use' });
-  req.restaurant.customDomain = domain;
-  req.restaurant.customDomainStatus = 'pending_dns';
-  req.restaurant.customDomainToken = randomToken(12);
-  await req.restaurant.save();
-  res.json(domainInstructions(req.restaurant));
+/* ---------- Custom domain (Pro) ----------
+ * Logic lives in services/customDomain.js (state machine) + services/vercel.js (Vercel REST API). Routes stay thin:
+ * the restaurant is always the CALLER'S OWN (loadRestaurant), so one owner can never touch another tenant's domain. */
+const domainRoute = (fn) => wrap(async (req, res) => {
+  try { await fn(req, res); }
+  catch (e) {
+    if (e instanceof DomainError) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+});
+
+r.put('/custom-domain', requirePro('Custom domain'), validate(z.object({ domain: z.string().min(3).max(300) })), domainRoute(async (req, res) => {
+  res.json(await registerDomain(req.restaurant, req.body.domain));
 }));
 
-function domainInstructions(rest) {
-  return {
-    domain: rest.customDomain, status: rest.customDomainStatus,
-    dns: [
-      { type: 'CNAME', host: rest.customDomain, value: process.env.CUSTOM_DOMAIN_TARGET || process.env.PLATFORM_DOMAIN },
-      { type: 'TXT', host: `_orderly-verify.${rest.customDomain}`, value: `orderly-verify=${rest.customDomainToken}` },
-    ],
-    note: 'DNS changes can take up to 48 hours. The domain also has to be added to your hosting provider so it can issue an SSL certificate.',
-  };
-}
-
+// Readable even after a downgrade so the owner can still see and remove the domain.
 r.get('/custom-domain', wrap(async (req, res) => {
-  if (!req.restaurant.customDomain) return res.json({ domain: null });
-  res.json(domainInstructions(req.restaurant));
+  res.json({ ...domainView(req.restaurant), available: vercelConfigured() });
 }));
 
-r.post('/custom-domain/verify', requirePro('Custom domain'), wrap(async (req, res) => {
-  const rest = req.restaurant;
-  if (!rest.customDomain) return res.status(400).json({ error: 'No domain set' });
-  try {
-    const txt = (await dns.resolveTxt(`_orderly-verify.${rest.customDomain}`)).flat();
-    if (txt.includes(`orderly-verify=${rest.customDomainToken}`)) {
-      rest.customDomainStatus = 'verified'; await rest.save();
-      return res.json({ verified: true, ...domainInstructions(rest) });
-    }
-  } catch { /* fall through */ }
-  res.json({ verified: false, ...domainInstructions(rest), error: 'TXT record not found yet. DNS may still be propagating.' });
+r.post('/custom-domain/verify', requirePro('Custom domain'), domainRoute(async (req, res) => {
+  if (!req.restaurant.customDomain) throw new DomainError('No domain set', 400);
+  res.json(await checkNow(req.restaurant));
 }));
 
-r.delete('/custom-domain', wrap(async (req, res) => {
-  req.restaurant.customDomain = undefined; req.restaurant.customDomainStatus = 'none'; req.restaurant.customDomainToken = undefined;
-  await req.restaurant.save(); res.json({ ok: true });
+r.delete('/custom-domain', domainRoute(async (req, res) => {
+  await disconnectDomain(req.restaurant);
+  res.json({ ok: true, ...domainView(await Restaurant.findById(req.restaurant._id)) });
 }));
 
 /* ---------- Fulfillment & radius delivery pricing (Pro) ---------- */

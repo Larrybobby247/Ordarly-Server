@@ -8,11 +8,14 @@ import { sendEmail, btn } from '../services/email.js';
 import { startOrderPayment } from '../services/orderPayments.js';
 import { notifyRestaurant } from '../services/notify.js';
 import { getCached, setCached } from '../services/publicCache.js';
+import { SERVING, publicBaseFor } from '../services/customDomain.js';
+import { cleanHostInput, isPlatformHost } from '../services/domainUtils.js';
 
 const r = Router();
 
 async function findRestaurant(key, byDomain = false) {
-  const q = byDomain ? { customDomain: key.toLowerCase(), customDomainStatus: 'verified' } : { slug: key.toLowerCase() };
+  // Hostname lookups only ever match a domain that is ACTIVE (or a legacy-verified one awaiting re-check); unverified claims never resolve.
+  const q = byDomain ? { customDomain: key.toLowerCase(), ...SERVING } : { slug: key.toLowerCase() };
   const rest = await Restaurant.findOne(q);
   if (!rest || rest.status !== 'active') return null;
   const sub = await Subscription.findOne({ restaurant: rest._id }).lean(); // PERF: plain object, read-only
@@ -55,6 +58,7 @@ async function publicPayload(found) {
     meals: meals.map((m) => ({
       _id: m._id, name: m.name, description: m.description, price: m.price, image: m.image, category: m.category,
       available: m.available, prepTime: m.prepTime, portion: m.portion, tags: m.tags || [], popular: !!m.popular,
+      sizes: (m.sizes || []).filter((z) => z.available !== false).map((z) => ({ _id: String(z._id), name: z.name, price: z.price })),
       addons: (m.addons || []).filter((a) => a.available !== false)
         .map((a) => ({ _id: String(a._id), name: a.name, price: a.price, group: a.group || 'Extras' })),
     })),
@@ -81,35 +85,50 @@ async function publicPayload(found) {
 // PERF (changed): public pages are served from a 30-second server cache, and browsers/CDNs may reuse the response for 10 seconds
 // (stale-while-revalidate lets them show it instantly while refreshing). The data is public and the cache is cleared whenever the owner edits anything.
 const PUBLIC_CACHE_HEADER = 'public, max-age=10, stale-while-revalidate=60';
-async function servePublic(res, key, find, notFound) {
+async function servePublic(res, key, find, notFound, code) {
   const hit = getCached(key);
   if (hit) { res.set('Cache-Control', PUBLIC_CACHE_HEADER); return res.json(hit); }
   const f = await find();
-  if (!f) return res.status(404).json({ error: notFound });
+  if (!f) return res.status(404).json({ error: notFound, ...(code ? { code } : {}) });
   const payload = await publicPayload(f);
   setCached(key, payload);
   res.set('Cache-Control', PUBLIC_CACHE_HEADER);
   return res.json(payload);
 }
 
-r.get('/by-domain/:domain', wrap((req, res) => servePublic(res, `d:${req.params.domain.toLowerCase()}`, () => findRestaurant(req.params.domain, true), 'Not found')));
+// Hostname-based identification. The hostname is validated and normalised; unknown, unverified or disconnected domains get a clear 404.
+// Platform hostnames answer { platform: true } so the frontend can tell "this is Ordarly itself" from "unknown domain" without guessing.
+r.get('/by-domain/:domain', wrap((req, res) => {
+  const host = cleanHostInput(req.params.domain);
+  if (!host || host.length > 253 || !/^[a-z0-9.-]+$/.test(host)) return res.status(404).json({ error: 'This address is not connected to a restaurant.', code: 'DOMAIN_NOT_FOUND' });
+  if (isPlatformHost(host)) return res.json({ platform: true });
+  return servePublic(res, `d:${host}`, () => findRestaurant(host, true), 'This address is not connected to a restaurant.', 'DOMAIN_NOT_FOUND');
+}));
 
 r.get('/r/:slug', wrap((req, res) => servePublic(res, `s:${req.params.slug.toLowerCase()}`, () => findRestaurant(req.params.slug), 'Restaurant not found')));
 
 /* ---------- Cart pricing: ALWAYS from DB (meal price + chosen add-ons) ---------- */
 const cartSchema = z.array(z.object({
-  mealId: z.string(), quantity: z.number().int().min(1).max(50), addonIds: z.array(z.string()).max(20).optional(),
+  mealId: z.string(), quantity: z.number().int().min(1).max(50), sizeId: z.string().max(40).optional(), addonIds: z.array(z.string()).max(20).optional(),
 })).min(1).max(60);
 
 async function priceCart(rest, cart) {
   const ids = [...new Set(cart.map((c) => c.mealId))].filter((id) => mongoose.isValidObjectId(id));
   // PERF (changed): only the fields needed to price the cart, as plain objects (.lean()) instead of full Mongoose documents.
-  const meals = await Meal.find({ _id: { $in: ids }, restaurant: rest._id }).select('name price available addons').lean();
+  const meals = await Meal.find({ _id: { $in: ids }, restaurant: rest._id }).select('name price available addons sizes').lean();
   const map = new Map(meals.map((m) => [String(m._id), m]));
   const unavailable = [], items = [];
   for (const c of cart) {
     const m = map.get(c.mealId);
     if (!m || !m.available) { unavailable.push(c.mealId); continue; }
+    // Size-priced meals (e.g. 10" / 12" / 14"): a valid, available size is required and replaces the base price.
+    const sizes = (m.sizes || []).filter((x) => x.available !== false);
+    let basePrice = m.price, sizeName;
+    if (sizes.length) {
+      const sz = sizes.find((x) => String(x._id) === c.sizeId);
+      if (!sz) { unavailable.push(c.mealId); continue; }
+      basePrice = sz.price; sizeName = sz.name;
+    }
     const picked = []; let bad = false;
     for (const id of new Set(c.addonIds || [])) {
       const a = m.addons.find((x) => String(x._id) === id && x.available !== false);
@@ -117,9 +136,9 @@ async function priceCart(rest, cart) {
       picked.push({ name: a.name, price: a.price });
     }
     if (bad) { unavailable.push(c.mealId); continue; }
-    const unit = m.price + picked.reduce((s, a) => s + a.price, 0);
-    // `price` is the per-unit price INCLUDING add-ons so totals everywhere are simply price x quantity.
-    items.push({ meal: m._id, name: m.name, basePrice: m.price, addons: picked, price: unit, quantity: c.quantity });
+    const unit = basePrice + picked.reduce((s, a) => s + a.price, 0);
+    // `price` is the per-unit price INCLUDING size + add-ons so totals everywhere are simply price x quantity.
+    items.push({ meal: m._id, name: m.name, size: sizeName, basePrice, addons: picked, price: unit, quantity: c.quantity });
   }
   const subtotal = items.reduce((s, i) => s + i.price * i.quantity, 0);
   return { items, unavailable, subtotal };
@@ -169,7 +188,7 @@ function waResponse(rest, order) {
     `*${rest.name}*`, `Order ref: ${order.reference}`, '',
     ...order.items.map((i) => {
       const extras = i.addons?.length ? ` (+ ${i.addons.map((a) => a.name).join(', ')})` : '';
-      return `• ${i.quantity} x ${i.name}${extras} — ${naira(i.price)} each (${naira(i.price * i.quantity)})`;
+      return `• ${i.quantity} x ${i.name}${i.size ? ` [${i.size}]` : ''}${extras} — ${naira(i.price)} each (${naira(i.price * i.quantity)})`;
     }),
     '', `Subtotal: ${naira(order.subtotal)}`,
   ];
@@ -259,7 +278,8 @@ r.post('/r/:slug/checkout', validate(checkoutSchema), wrap(async (req, res) => {
     paymentMethod: b.paymentMethod, paymentStatus, status: 'pending', notes: b.notes, idempotencyKey: b.idempotencyKey,
   });
 
-  const trackUrl = `${process.env.CLIENT_URL}/track/${token}`;
+  // Links back to the restaurant's own domain when the order came from it; otherwise the main Ordarly site.
+  const trackUrl = `${await publicBaseFor(req, rest, isPro)}/track/${token}`;
   // Paystack: start the payment right now so the customer goes straight to the payment page (no extra page or tap).
   let paymentUrl;
   if (b.paymentMethod === 'paystack') {
@@ -291,7 +311,7 @@ r.get('/track/:token', wrap(async (req, res) => {
   const rest = await Restaurant.findById(order.restaurant).lean();
   res.json({
     reference: order.reference, restaurant: rest.name, restaurantSlug: rest.slug,
-    items: order.items.map(({ name, quantity, price, addons }) => ({ name, quantity, price, addons })),
+    items: order.items.map(({ name, size, quantity, price, addons }) => ({ name, size, quantity, price, addons })),
     subtotal: order.subtotal, deliveryFee: order.deliveryFee, total: order.total, fulfillment: order.fulfillment,
     pickupAddress: order.fulfillment === 'pickup' ? rest.address : undefined,
     deliveryAddress: order.deliveryAddress ? `${order.deliveryAddress}${order.deliveryPlace ? ', ' + order.deliveryPlace : ''}` : undefined,
