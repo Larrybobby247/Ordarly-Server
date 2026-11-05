@@ -6,6 +6,7 @@ import { wrap, randomToken } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant } from '../middleware/auth.js';
 import { activateFromPayment, ensureSubscription } from '../services/subscription.js';
 import { getPlanConfig } from '../services/settings.js';
+import { yearlyQuote } from '../config/plans.js';
 
 const PS = 'https://api.paystack.co';
 const ps = (path, opts = {}) => fetch(PS + path, {
@@ -35,7 +36,7 @@ subscriptionRouter.use(requireAuth, loadRestaurant);
 subscriptionRouter.get('/', wrap(async (req, res) => {
   const payments = await SubscriptionPayment.find({ restaurant: req.restaurant._id }).sort('-createdAt').limit(20).lean();
   const cfg = await getPlanConfig();
-  res.json({ subscription: req.subscription, isPro: req.isPro, price: cfg.pro.priceNgn, payments });
+  res.json({ subscription: req.subscription, isPro: req.isPro, price: cfg.pro.priceNgn, yearly: yearlyQuote(cfg), payments });
 }));
 
 subscriptionRouter.post('/checkout', wrap(async (req, res) => {
@@ -46,12 +47,16 @@ subscriptionRouter.post('/checkout', wrap(async (req, res) => {
   const cfg = await getPlanConfig();
   const sub = await ensureSubscription(req.restaurant._id);
   const reference = 'SUB-' + randomToken(10);
-  const amount = cfg.pro.priceNgn;
+  // The client only says WHICH plan; the amount and length of access are decided here, never taken from the browser.
+  const interval = req.body?.interval === 'yearly' ? 'yearly' : 'monthly';
+  const yearly = yearlyQuote(cfg);
+  const amount = interval === 'yearly' ? yearly.price : cfg.pro.priceNgn;
+  const periodDays = interval === 'yearly' ? yearly.periodDays : cfg.pro.periodDays;
   const payment = await SubscriptionPayment.create({
     restaurant: req.restaurant._id,
     subscription: sub._id,
     providerReference: reference,
-    amount,
+    amount, interval, periodDays,
   });
 
   const data = await ps('/transaction/initialize', {
@@ -64,6 +69,7 @@ subscriptionRouter.post('/checkout', wrap(async (req, res) => {
       callback_url: `${process.env.CLIENT_URL}/dashboard/subscription?ref=${reference}`,
       metadata: {
         purpose: 'pro_subscription',
+        interval,
         restaurantId: String(req.restaurant._id),
       },
     }),

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { Complaint, Restaurant } from '../models/index.js';
 import { z, validate, wrap, randomToken, escapeHtml } from '../utils/helpers.js';
 import { getPlatformSettings, getPlanConfig } from '../services/settings.js';
+import { yearlyQuote } from '../config/plans.js';
 import { sendEmail } from '../services/email.js';
 import { autocomplete } from '../services/places.js';
 
@@ -12,7 +13,7 @@ r.get('/platform', wrap(async (req, res) => {
   res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300'); // PERF (new): public, rarely-changing settings
   const [s, plans] = await Promise.all([getPlatformSettings(), getPlanConfig()]);
   res.json({
-    pricing: { proPriceNgn: plans.pro.priceNgn, trialDays: plans.pro.trialDays, freeMeals: plans.free.maxActiveMeals },
+    pricing: { proPriceNgn: plans.pro.priceNgn, yearlyPriceNgn: yearlyQuote(plans).price, yearlyDiscountPct: yearlyQuote(plans).discountPct, trialDays: plans.pro.trialDays, freeMeals: plans.free.maxActiveMeals },
     supportEmail: s.supportEmail,
     registrationOpen: s.registrationOpen,
     announcement: s.announcement.enabled && s.announcement.text ? s.announcement : { enabled: false },
