@@ -22,8 +22,31 @@ export const Restaurant = mongoose.model('Restaurant', new Schema({
   name: { type: String, required: true, trim: true },
   slug: { type: String, required: true, unique: true, lowercase: true },
   customDomain: { type: String, lowercase: true, trim: true, unique: true, sparse: true },
-  customDomainStatus: { type: String, enum: ['none', 'pending_dns', 'verified'], default: 'none' },
+  // Lifecycle: none -> pending_dns -> verifying -> verified (ownership proven) -> configuring (Vercel routing/SSL) -> active.
+  // 'failed' is terminal until the owner retries. Legacy records only ever held none/pending_dns/verified.
+  customDomainStatus: { type: String, enum: ['none', 'pending_dns', 'verifying', 'verified', 'configuring', 'active', 'failed'], default: 'none', index: true },
   customDomainToken: { type: String },
+  customDomainMeta: {
+    vercelProjectId: String,                 // project the domain was registered with
+    isApex: Boolean,
+    apexName: String,
+    ownershipVerified: { type: Boolean, default: false },   // our _orderly-verify TXT record was found
+    ownershipVerifiedAt: Date,
+    vercelVerified: { type: Boolean, default: false },      // Vercel accepted its own verification challenge
+    vercelChallenge: { type: [new Schema({ type: { type: String }, domain: String, value: String, reason: String }, { _id: false })], default: [] },
+    dnsConfigured: { type: Boolean, default: false },       // Vercel reports the domain routes to it (misconfigured === false)
+    configuredBy: String,                    // CNAME | A | http | dns-01 as reported by Vercel
+    recommended: { type: [new Schema({ type: { type: String }, host: String, hostLabel: String, value: String, purpose: String, note: String }, { _id: false })], default: [] },
+    sslReady: { type: Boolean, default: false },
+    createdAt: Date,
+    activatedAt: Date,
+    lastCheckedAt: Date,
+    nextCheckAt: Date,                       // background worker only looks at domains whose time has come
+    checkAttempts: { type: Number, default: 0 },
+    lastError: String,
+    lastErrorCode: String,
+    legacy: { type: Boolean, default: false }, // verified before the Vercel integration existed; kept serving until re-checked
+  },
   description: { type: String, default: '' },
   logo: String,
   cover: String,
@@ -76,6 +99,16 @@ export const Meal = mongoose.model('Meal', new Schema({
   available: { type: Boolean, default: true },
   prepTime: { type: Number, min: 0, max: 600, default: null }, // minutes
   portion: { type: String, trim: true, maxlength: 60, default: '' },
+  // Optional size-based pricing (e.g. 10" Medium / 12" Large / 14" Family). When present, `price` mirrors the cheapest
+  // available size so existing screens that show a single price keep working, and customers must pick a size.
+  sizes: {
+    type: [new Schema({
+      name: { type: String, required: true, trim: true, maxlength: 60 },
+      price: { type: Number, required: true, min: 0 },
+      available: { type: Boolean, default: true },
+    })],
+    default: [],
+  },
   tags: { type: [String], default: [] },
   popular: { type: Boolean, default: false },
   // Optional extras the restaurant recommends with this meal (extra turkey, drinks...). No images.
@@ -92,7 +125,8 @@ export const Meal = mongoose.model('Meal', new Schema({
 
 const itemSnap = new Schema({
   meal: oid('Meal'), name: String,
-  price: Number, // per-unit price INCLUDING add-ons, so line total is always price x quantity
+  price: Number, // per-unit price INCLUDING size + add-ons, so line total is always price x quantity
+  size: String, // chosen size label, when the meal is sold by size
   basePrice: Number, addons: [{ _id: false, name: String, price: Number }],
   quantity: Number,
 }, { _id: false });
@@ -157,8 +191,11 @@ export const SubscriptionPayment = mongoose.model('SubscriptionPayment', new Sch
   providerReference: { type: String, required: true, unique: true },
   amount: Number, currency: { type: String, default: 'NGN' },
   status: { type: String, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  interval: { type: String, enum: ['monthly', 'yearly'], default: 'monthly' }, // what this payment bought
+  periodDays: Number,   // length of access this payment grants (fixed when the payment is created)
   periodStart: Date, periodEnd: Date,
   verifiedAt: Date,
+  raw: Schema.Types.Mixed, activationError: String, activationErrorAt: Date,
 }, { timestamps: true }));
 
 export const PaymentConfig = mongoose.model('PaymentConfig', new Schema({
