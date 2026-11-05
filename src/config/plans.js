@@ -5,6 +5,7 @@ export const DEFAULT_PLAN_CONFIG = {
   pro: {
     priceNgn: 7500,
     periodDays: 30,
+    yearlyDiscountPct: 5, // paying for 12 months up front is this % cheaper than 12 monthly payments
     trialDays: 14,
     maxActiveMeals: null, // unlimited
     features: [
@@ -54,3 +55,14 @@ export const ORDER_TRANSITIONS = {
   completed: [],
   cancelled: [],
 };
+
+export const YEARLY_PERIOD_DAYS = 365;
+
+/** Yearly price = 12 months minus the discount, rounded to a whole naira. Always computed on the server from the live monthly price. */
+export function yearlyQuote(cfg) {
+  const monthly = cfg.pro.priceNgn;
+  const pct = cfg.pro.yearlyDiscountPct ?? DEFAULT_PLAN_CONFIG.pro.yearlyDiscountPct;
+  const full = monthly * 12;
+  const price = Math.round(full * (1 - pct / 100));
+  return { price, discountPct: pct, fullPrice: full, savings: full - price, monthlyEquivalent: Math.round(price / 12), periodDays: YEARLY_PERIOD_DAYS };
+}
