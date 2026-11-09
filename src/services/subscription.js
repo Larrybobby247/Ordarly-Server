@@ -21,32 +21,19 @@ export function isProActive(sub, now = new Date()) {
   return false;
 }
 
+/** 'business' | 'pro' | 'free' for a subscription right now. Business and Pro both unlock every Pro feature (isProActive). */
+export function planOf(sub, now = new Date()) {
+  if (!isProActive(sub, now)) return 'free';
+  return sub.plan === 'business' ? 'business' : 'pro';
+}
+
 async function ownerOf(restaurantId) {
   const r = await Restaurant.findById(restaurantId).lean();
   const u = r && (await User.findById(r.owner).lean());
   return { r, u };
 }
 
-export async function startTrial(restaurantId) {
-  const cfg = await getPlanConfig();
-  const sub = await ensureSubscription(restaurantId);
-  if (sub.trialUsed) throw Object.assign(new Error('Trial already used'), { status: 409 });
-  if (isProActive(sub)) throw Object.assign(new Error('Pro already active'), { status: 409 });
-  const now = new Date();
-  sub.plan = 'pro'; sub.status = 'trialing'; sub.trialUsed = true;
-  sub.trialStart = now; sub.trialEnd = new Date(+now + cfg.pro.trialDays * DAY);
-  sub.remindersSent = {};
-  await sub.save();
-  await Restaurant.updateOne({ _id: restaurantId }, { plan: 'pro' });
-  const { r, u } = await ownerOf(restaurantId);
-  await sendEmail({
-    to: u?.email, type: 'trial_started', restaurant: restaurantId,
-    dedupeKey: `trial_started:${sub._id}`,
-    subject: 'Your 14-day Pro trial has started',
-    body: `<p>Hi ${u?.name}, Pro is now active for <b>${r?.name}</b> until ${sub.trialEnd.toDateString()}.</p>${btn(clientUrl() + '/dashboard/subscription', 'View subscription')}`,
-  });
-  return sub;
-}
+// The 14-day Pro trial was retired: no new trials can start. Subscriptions already in status 'trialing' simply run to their trialEnd (see isProActive).
 
 /** Called ONLY after server-side Paystack verification. Idempotent per payment reference.
  *  Accepts either a pending paymentDoc (will try to claim) OR an already-claimed document.
@@ -121,22 +108,26 @@ export async function activateFromPayment(paymentDoc) {
 async function finishActivation(claimed, cfg) {
   const sub = await ensureSubscription(claimed.restaurant);
   const now = new Date();
-  const base = isProActive(sub, now) && sub.status === 'active' && sub.periodEnd > now ? sub.periodEnd : now;
-  sub.plan = 'pro'; sub.status = 'active';
+  const plan = claimed.plan === 'business' ? 'business' : 'pro';
+  // Renewing the SAME plan stacks on the remaining time. Switching plans (Pro -> Business) starts the new plan today,
+  // so unused Pro days are not silently converted into more expensive Business days.
+  const sameActive = isProActive(sub, now) && sub.status === 'active' && sub.periodEnd > now && sub.plan === plan;
+  const base = sameActive ? sub.periodEnd : now;
+  sub.plan = plan; sub.status = 'active';
   sub.periodStart = sub.periodStart && base > now ? sub.periodStart : now;
   // Length of access was fixed when the payment was created (30 days monthly, 365 yearly); older payments fall back to the monthly length.
-  sub.periodEnd = new Date(+base + (claimed.periodDays || cfg.pro.periodDays) * DAY);
+  sub.periodEnd = new Date(+base + (claimed.periodDays || cfg[plan].periodDays || cfg.pro.periodDays) * DAY);
   sub.lastPaymentReference = claimed.providerReference;
   sub.remindersSent = {};
   await sub.save();
-  await Restaurant.updateOne({ _id: claimed.restaurant }, { plan: 'pro' });
+  await Restaurant.updateOne({ _id: claimed.restaurant }, { plan });
   const { r, u } = await ownerOf(claimed.restaurant);
   // Not awaited: don't let email provider failures block activation
   sendEmail({
     to: u?.email, type: 'subscription_paid', restaurant: claimed.restaurant,
     dedupeKey: `sub_paid:${claimed.providerReference}`,
-    subject: 'Pro subscription confirmed',
-    body: `<p>Payment received for <b>${r?.name}</b>${claimed.interval === 'yearly' ? ' (yearly plan)' : ''}. Pro is active until ${sub.periodEnd.toDateString()}.</p>`,
+    subject: `${plan === 'business' ? 'Business' : 'Pro'} subscription confirmed`,
+    body: `<p>Payment received for <b>${r?.name}</b>${claimed.interval === 'yearly' ? ' (yearly plan)' : ''}. ${plan === 'business' ? 'Business' : 'Pro'} is active until ${sub.periodEnd.toDateString()}.</p>`,
   }).catch((e) => console.error('[subscription] sendEmail failed', e));
   return sub;
 }
@@ -183,16 +174,17 @@ export async function runSubscriptionSweep() {
 }
 
 /** Support tool: give a restaurant N days of Pro without a payment. Always audited by the caller. */
-export async function adminGrantPro(restaurantId, days) {
+export async function adminGrantPro(restaurantId, days, plan = 'pro') {
   const sub = await ensureSubscription(restaurantId);
   const now = new Date();
   const base = sub.status === 'active' && sub.periodEnd > now ? sub.periodEnd : now;
-  sub.plan = 'pro'; sub.status = 'active';
-  sub.periodStart = sub.periodStart && base > now ? sub.periodStart : now;
-  sub.periodEnd = new Date(+base + days * DAY);
+  const base2 = sub.plan === plan ? base : now; // switching plan starts today
+  sub.plan = plan; sub.status = 'active';
+  sub.periodStart = sub.periodStart && base2 > now ? sub.periodStart : now;
+  sub.periodEnd = new Date(+base2 + days * DAY);
   sub.lastPaymentReference = 'ADMIN-GRANT'; sub.remindersSent = {};
   await sub.save();
-  await Restaurant.updateOne({ _id: restaurantId }, { plan: 'pro' });
+  await Restaurant.updateOne({ _id: restaurantId }, { plan });
   const { r, u } = await ownerOf(restaurantId);
   await sendEmail({ to: u?.email, type: 'pro_granted', restaurant: restaurantId, dedupeKey: `grant:${sub._id}:${+sub.periodEnd}`,
     subject: 'Pro access added to your restaurant',

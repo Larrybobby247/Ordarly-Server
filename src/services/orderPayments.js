@@ -3,6 +3,9 @@ import { ps } from './paystack.js';
 import { sendEmail, btn } from './email.js';
 import { naira, randomToken } from '../utils/helpers.js';
 import { notifyRestaurant } from './notify.js';
+import { recordSale } from './ledger.js';
+import { formatLocal, tzOf } from './tz.js';
+import { commissionKobo } from './earningsMath.js';
 
 const audit = (order, by, field, from, to, note) => order.audit.push({ at: new Date(), by, field, from, to, note });
 const asString = (value) => (value === undefined || value === null ? '' : String(value));
@@ -25,8 +28,10 @@ const parseMeta = (m) => {
 /**
  * Start a Paystack payment for ONE food order.
  * Amount always comes from the stored order total. Funds are routed to the restaurant's subaccount and the
- * restaurant bears Paystack's fee (bearer: 'subaccount'). We do NOT pass transaction_charge, and the
- * subaccount is created with percentage_charge 0, so the platform takes no commission.
+ * restaurant bears Paystack's fee (bearer: 'subaccount'). The subaccount is created with percentage_charge 0, so by default the
+ * platform takes nothing. For plans with a commission (Free), the stored order carries a commission snapshot and we pass it as
+ * Paystack's flat `transaction_charge` (kobo): that amount goes to Ordarly's main account and the restaurant's subaccount gets the rest.
+ * The charge is computed from the order's MEAL SUBTOTAL only (delivery is excluded) and from stored values, never from the browser.
  */
 export async function startOrderPayment(order, restaurant, callbackUrl) {
   const cfg = await PaymentConfig.findOne({ restaurant: restaurant._id });
@@ -54,6 +59,7 @@ export async function startOrderPayment(order, restaurant, callbackUrl) {
       body: {
         email: order.customerEmail, amount: Math.round(order.total * 100), currency: 'NGN', reference,
         subaccount: cfg.subaccountCode, bearer: 'subaccount',
+        ...(commissionKobo(order.subtotal, order.commissionPct) > 0 ? { transaction_charge: commissionKobo(order.subtotal, order.commissionPct) } : {}),
         callback_url: callbackUrl,
         metadata: {
           purpose: 'food_order',
@@ -214,8 +220,12 @@ export async function verifyOrderPayment(payment) {
         order.paymentStatus = 'paid';
         await order.save();
       }
+      // Ledger: created once per order (unique index), so retries and duplicate webhooks cannot book anything twice.
+      await recordSale(order, { gatewayFeeKobo: Number.isFinite(Number(t.fees)) ? Number(t.fees) : undefined });
 
       const rest = await Restaurant.findById(order.restaurant);
+      const when = order.isScheduled && order.scheduledFor ? formatLocal(order.scheduledFor, tzOf(rest)) : null;
+      const where = order.branchName ? ` · ${order.branchName}` : '';
 
       await Promise.allSettled([
         sendEmail({
@@ -233,12 +243,12 @@ export async function verifyOrderPayment(payment) {
           restaurant: order.restaurant,
           order: order._id,
           dedupeKey: `paid-r:${payment.providerReference}`,
-          subject: `Order ${order.reference} paid online`,
-          body: `<p>${naira(order.total)} was paid and verified through Paystack. Settlement to your bank follows Paystack's schedule for your account.</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}`,
+          subject: `${when ? 'Scheduled order' : 'Order'} ${order.reference} paid online${where}`,
+          body: `<p>${naira(order.total)} was paid and verified through Paystack. Settlement to your bank follows Paystack's schedule for your account.${when ? ` <b>This order is scheduled for ${when}.</b> Do not prepare it yet.` : ''}</p>${btn(`${process.env.CLIENT_URL}/dashboard/orders`, 'Open orders')}`,
         }),
         notifyRestaurant(order.restaurant, {
-          title: 'New paid order',
-          body: `${order.reference} · ${naira(order.total)} paid online`,
+          title: when ? 'New scheduled order' : 'New paid order',
+          body: `${order.reference} · ${naira(order.total)} paid online${where}${when ? ' · for ' + when : ''}`,
           url: '/dashboard/orders',
           tag: `order-${order._id}`,
         }),

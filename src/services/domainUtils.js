@@ -1,5 +1,6 @@
 // Pure helpers for custom domains (no database, no network) so they are easy to unit-test.
 import net from 'net';
+import { RESERVED_SLUGS } from '../config/plans.js';
 
 const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
 const TLD = /^(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})$/;
@@ -99,3 +100,28 @@ export function routingRecords(domain, config) {
 
 /** Does a CNAME/A answer point at Vercel? Compares to the targets Vercel recommended (trailing dots and case ignored). */
 export const sameTarget = (a, b) => String(a).toLowerCase().replace(/\.$/, '') === String(b).toLowerCase().replace(/\.$/, '');
+
+/** The platform's own domain, e.g. "ordarly.com.ng" (PLATFORM_DOMAIN), without port. */
+export const platformDomain = () => cleanHostInput(process.env.PLATFORM_DOMAIN || '') || 'ordarly.com.ng';
+
+/**
+ * <slug>.<platform domain> -> slug. Only a single, valid, non-reserved label counts, so "a.b.ordarly.com.ng",
+ * "www.ordarly.com.ng" and "api.ordarly.com.ng" are never treated as restaurants.
+ */
+export function platformSubdomainSlug(host) {
+  const h = cleanHostInput(host), root = platformDomain();
+  if (!h.endsWith('.' + root)) return null;
+  const label = h.slice(0, -(root.length + 1));
+  if (!/^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/.test(label) || RESERVED_SLUGS.has(label)) return null;
+  return label;
+}
+
+/** Where a restaurant's customers should land: its verified custom domain, else <slug>.<platform> when wildcard subdomains are switched on, else the path URL. */
+export function restaurantUrl(rest, { customDomainActive = false } = {}) {
+  if (customDomainActive && rest.customDomain) return `https://${rest.customDomain}`;
+  if (process.env.WILDCARD_SUBDOMAINS === 'true') return `https://${rest.slug}.${platformDomain()}`;
+  return `${(process.env.CLIENT_URL || '').replace(/\/+$/, '')}/${rest.slug}`;
+}
+/** Base for links that need a path of their own (/track/...): origin only, no slug. */
+export const restaurantBase = (rest, opts) => ((process.env.WILDCARD_SUBDOMAINS === 'true' || (opts?.customDomainActive && rest.customDomain)) ? restaurantUrl(rest, opts) : (process.env.CLIENT_URL || '').replace(/\/+$/, ''));
+

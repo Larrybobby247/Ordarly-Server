@@ -2,7 +2,7 @@
 import { Restaurant, User } from '../models/index.js';
 import { randomToken } from '../utils/helpers.js';
 import * as V from './vercel.js';
-import { validateCustomDomain, reservedHosts, cleanHostInput, isPlatformHost, routingRecords, apexOf } from './domainUtils.js';
+import { validateCustomDomain, reservedHosts, cleanHostInput, isPlatformHost, routingRecords, apexOf, platformSubdomainSlug, restaurantBase } from './domainUtils.js';
 import { runPipeline, ownershipHost, ownershipValue, nextDelayMs, WORKING } from './domainPipeline.js';
 import { clearPublicCache } from './publicCache.js';
 import { sendEmail } from './email.js';
@@ -19,14 +19,23 @@ const hostCache = new Map(); // host -> { at, id|null }
 const HOST_TTL = 60 * 1000;
 export const clearDomainCache = () => { hostCache.clear(); clearPublicCache(); };
 
-/** Active, Pro, non-suspended restaurant that owns this exact hostname, or null. */
+export { platformDomain, platformSubdomainSlug, restaurantUrl, restaurantBase } from './domainUtils.js';
+
+/** Active, non-suspended restaurant that owns this exact hostname, or null. Custom domains also need a paid plan. */
 export async function restaurantForHost(rawHost) {
   const host = cleanHostInput(rawHost);
   if (!host || isPlatformHost(host)) return null;
   const hit = hostCache.get(host);
   if (hit && Date.now() - hit.at < HOST_TTL) return hit.id;
-  const r = await Restaurant.findOne({ customDomain: host, status: 'active', ...SERVING }).select('_id plan').lean();
-  const id = r && r.plan === 'pro' ? String(r._id) : null;
+  let id = null;
+  const slug = platformSubdomainSlug(host);
+  if (slug) {
+    const r = await Restaurant.findOne({ slug, status: 'active' }).select('_id').lean();
+    id = r ? String(r._id) : null;
+  } else {
+    const r = await Restaurant.findOne({ customDomain: host, status: 'active', ...SERVING }).select('_id plan').lean();
+    id = r && r.plan !== 'free' ? String(r._id) : null;
+  }
   if (hostCache.size > 2000) hostCache.clear();
   hostCache.set(host, { at: Date.now(), id });
   return id;
@@ -41,11 +50,14 @@ export async function isAllowedCustomOrigin(origin) {
 
 /** Base URL for links we put in emails / Paystack callbacks: the restaurant's own domain when the request really came from it. */
 export async function publicBaseFor(req, rest, isPro = true) {
-  const fallback = (process.env.CLIENT_URL || '').replace(/\/+$/, '');
+  const fallback = restaurantBase(rest, { customDomainActive: false });
   try {
-    const o = req.get?.('origin'); if (!o || !rest?.customDomain || !isPro) return fallback;
+    const o = req.get?.('origin'); if (!o) return fallback;
     const u = new URL(o);
-    if (u.protocol === 'https:' && u.hostname === rest.customDomain && (await restaurantForHost(u.hostname)) === String(rest._id)) return `https://${u.hostname}`;
+    if (u.protocol !== 'https:') return fallback;
+    const isOwnDomain = isPro && rest?.customDomain && u.hostname === rest.customDomain;
+    const isOwnSubdomain = platformSubdomainSlug(u.hostname) === rest.slug;
+    if ((isOwnDomain || isOwnSubdomain) && (await restaurantForHost(u.hostname)) === String(rest._id)) return `https://${u.hostname}`;
   } catch { /* fall through */ }
   return fallback;
 }
