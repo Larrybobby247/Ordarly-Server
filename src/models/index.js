@@ -7,7 +7,7 @@ export const User = mongoose.model('User', new Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   phone: { type: String, trim: true },
   passwordHash: { type: String, required: true, select: false },
-  role: { type: String, enum: ['owner', 'admin'], default: 'owner' },
+  role: { type: String, enum: ['owner', 'admin', 'staff'], default: 'owner' }, // 'staff' = invited employee/manager (no restaurant of their own)
   emailVerified: { type: Boolean, default: false },
   verifyTokenHash: { type: String, select: false },
   resetTokenHash: { type: String, select: false },
@@ -78,7 +78,17 @@ export const Restaurant = mongoose.model('Restaurant', new Schema({
     podEnabled: { type: Boolean, default: false },
   },
   subscription: oid('Subscription'),
-  plan: { type: String, enum: ['free', 'pro'], default: 'free', index: true }, // denormalised, maintained by subscription service
+  plan: { type: String, enum: ['free', 'pro', 'business'], default: 'free', index: true }, // denormalised, maintained by subscription service
+  // Order-for-later settings (owner-configurable). Hours come from the restaurant or branch; these control the booking window.
+  scheduling: {
+    enabled: { type: Boolean, default: false },
+    maxDaysAhead: { type: Number, default: 7, min: 1, max: 60 },
+    minNoticeMinutes: { type: Number, default: 60, min: 0, max: 7 * 24 * 60 },
+    slotMinutes: { type: Number, default: 30, min: 10, max: 240 },
+    capacityPerSlot: { type: Number, default: 0, min: 0, max: 500 }, // 0 = unlimited
+    reminderMinutes: { type: Number, default: 60, min: 5, max: 180 }, // restaurant is reminded this long before the slot
+    timezone: { type: String, default: 'Africa/Lagos' },
+  },
   status: { type: String, enum: ['active', 'suspended'], default: 'active' },
   suspendReason: String,
 }, { timestamps: true }));
@@ -141,6 +151,13 @@ const orderSchema = new Schema({
   subtotal: Number, deliveryFee: { type: Number, default: 0 }, total: Number,
   fulfillment: { type: String, enum: ['whatsapp_pickup', 'delivery', 'pickup', 'dine_in'] },
   deliveryAddress: String, deliveryPlace: String, deliveryDistanceKm: Number, deliveryLocation: { lat: Number, lng: Number }, tableNumber: String,
+  branch: oid('Branch', { default: null, index: true }), // null = the restaurant itself (single-location or pre-branch orders)
+  branchName: String, // snapshot, so history survives a rename
+  // Commission snapshot taken when the order is created (from the plan in force at that moment). Never from the client.
+  commissionPct: { type: Number, default: 0 }, commissionAmount: { type: Number, default: 0 },
+  refundedAmount: { type: Number, default: 0 },
+  // Order for later. scheduledFor is the REAL fulfilment time (UTC instant) and is never changed by status updates.
+  isScheduled: { type: Boolean, default: false }, scheduledFor: Date, slotReleased: { type: Boolean, default: false }, reminderSentAt: Date,
   paymentMethod: { type: String, enum: ['none', 'paystack', 'bank_transfer', 'pod'], default: 'none' },
   paymentStatus: { type: String, default: 'not_required' },
   status: { type: String, default: 'pending', index: true },
@@ -154,6 +171,8 @@ const orderSchema = new Schema({
 orderSchema.index({ restaurant: 1, createdAt: -1 });          // orders list, "today" counters, analytics ranges
 orderSchema.index({ restaurant: 1, status: 1, createdAt: -1 }); // filtered by status, new-order badge
 orderSchema.index({ restaurant: 1, paymentStatus: 1 });        // "proofs to review" counter
+orderSchema.index({ restaurant: 1, branch: 1, createdAt: -1 });   // branch dashboards
+orderSchema.index({ isScheduled: 1, scheduledFor: 1 });          // reminders + upcoming list
 export const Order = mongoose.model('Order', orderSchema);
 
 // Food-order payments and subscription payments are separate collections on purpose.
@@ -175,7 +194,7 @@ export const OrderPayment = mongoose.model('OrderPayment', new Schema({
 
 export const Subscription = mongoose.model('Subscription', new Schema({
   restaurant: oid('Restaurant', { required: true, unique: true }),
-  plan: { type: String, enum: ['free', 'pro'], default: 'free' },
+  plan: { type: String, enum: ['free', 'pro', 'business'], default: 'free' },
   status: { type: String, enum: ['free', 'trialing', 'active', 'expired'], default: 'free' },
   trialUsed: { type: Boolean, default: false },
   trialStart: Date, trialEnd: Date,
@@ -191,6 +210,7 @@ export const SubscriptionPayment = mongoose.model('SubscriptionPayment', new Sch
   providerReference: { type: String, required: true, unique: true },
   amount: Number, currency: { type: String, default: 'NGN' },
   status: { type: String, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  plan: { type: String, enum: ['pro', 'business'], default: 'pro' }, // which plan this payment bought
   interval: { type: String, enum: ['monthly', 'yearly'], default: 'monthly' }, // what this payment bought
   periodDays: Number,   // length of access this payment grants (fixed when the payment is created)
   periodStart: Date, periodEnd: Date,
@@ -286,3 +306,99 @@ export const PushSubscription = mongoose.model('PushSubscription', new Schema({
   keys: { p256dh: String, auth: String },
   userAgent: String,
 }, { timestamps: true }));
+
+/* ================= Business plan: branches, staff ================= */
+export const Branch = mongoose.model('Branch', new Schema({
+  restaurant: oid('Restaurant', { required: true, index: true }),
+  name: { type: String, required: true, trim: true, maxlength: 80 },
+  address: { type: String, trim: true, maxlength: 300, default: '' },
+  location: { placeId: String, address: String, lat: Number, lng: Number },
+  phone: { type: String, trim: true },
+  whatsapp: String,
+  openingHours: { type: [{ _id: false, day: Number, open: String, close: String, closed: Boolean }], default: [] }, // empty = use the restaurant's hours
+  acceptingOrders: { type: Boolean, default: true },
+  status: { type: String, enum: ['active', 'inactive'], default: 'active', index: true },
+  prepTimeMinutes: { type: Number, min: 0, max: 600, default: null },
+  fulfillment: {
+    pickupEnabled: { type: Boolean, default: true },
+    dineInEnabled: { type: Boolean, default: false },
+    deliveryEnabled: { type: Boolean, default: false },
+    pickupInstructions: { type: String, default: '' },
+    radius: { baseFee: { type: Number, default: 0 }, baseDistanceKm: { type: Number, default: 0 }, perKmRate: { type: Number, default: 0 }, maxRadiusKm: { type: Number, default: 0 }, configured: { type: Boolean, default: false } },
+  },
+  sort: { type: Number, default: 0 },
+}, { timestamps: true }));
+
+// A branch shares the restaurant's menu. These rows are the per-branch differences: sold out here, or a different price here.
+export const BranchMealOverride = mongoose.model('BranchMealOverride', (() => {
+  const sch = new Schema({
+    restaurant: oid('Restaurant', { required: true, index: true }),
+    branch: oid('Branch', { required: true }),
+    meal: oid('Meal', { required: true }),
+    available: { type: Boolean, default: null },   // null = inherit
+    price: { type: Number, min: 0, default: null }, // null = inherit (for meals sold without sizes)
+    sizes: { type: [new Schema({ sizeId: String, price: { type: Number, min: 0, default: null }, available: { type: Boolean, default: null } }, { _id: false })], default: [] },
+  }, { timestamps: true });
+  sch.index({ branch: 1, meal: 1 }, { unique: true });
+  return sch;
+})());
+
+export const StaffMember = mongoose.model('StaffMember', (() => {
+  const sch = new Schema({
+    restaurant: oid('Restaurant', { required: true, index: true }),
+    email: { type: String, required: true, lowercase: true, trim: true },
+    name: String,
+    user: oid('User', { default: null, index: true }),
+    role: { type: String, enum: ['branch_manager', 'all_branches_manager', 'custom'], required: true },
+    branches: [oid('Branch')],
+    allBranches: { type: Boolean, default: false }, // custom role only
+    perms: { type: [String], default: [] },         // custom role only
+    status: { type: String, enum: ['invited', 'active', 'revoked'], default: 'invited' },
+    tokenHash: { type: String, index: true, sparse: true },
+    expiresAt: Date,
+    invitedBy: oid('User'),
+    acceptedAt: Date,
+  }, { timestamps: true });
+  sch.index({ restaurant: 1, email: 1 }, { unique: true });
+  return sch;
+})());
+
+/* ================= Money ledger (one entry per order, created once) ================= */
+export const LedgerEntry = mongoose.model('LedgerEntry', (() => {
+  const sch = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    branch: oid('Branch', { default: null }),
+    order: oid('Order', { required: true }),
+    orderRef: String,
+    // held = paid, order not finished yet (pending settlement). earned = order completed, commission recognised.
+    // reversed = order cancelled or fully refunded: no commission, nothing earned.
+    status: { type: String, enum: ['held', 'earned', 'reversed'], default: 'held' },
+    plan: String,
+    paymentMethod: String,
+    mealSubtotal: { type: Number, default: 0 },
+    deliveryFee: { type: Number, default: 0 },
+    commissionPct: { type: Number, default: 0 },
+    commission: { type: Number, default: 0 },          // commission Ordarly keeps after refunds
+    commissionCharged: { type: Number, default: 0 },   // what the payment split actually sent to Ordarly at payment time
+    commissionReturnDue: { type: Number, default: 0 }, // part of the charged commission that must go back to the restaurant
+    commissionReturnedAt: Date,
+    gatewayFee: { type: Number, default: null },       // Paystack fee when Paystack reported it
+    refunded: { type: Number, default: 0 },
+    net: { type: Number, default: 0 },                 // restaurant net = meals - commission + delivery (x refund share), before gateway fees
+    eventAt: { type: Date, default: Date.now },        // paid time, then completion time: the date used by report filters
+    completedAt: Date, reversedAt: Date,
+    legacy: { type: Boolean, default: false },         // created for orders that existed before commissions (commission 0)
+  }, { timestamps: true });
+  sch.index({ order: 1 }, { unique: true });          // the database guarantees one ledger entry per order, so commission can never be booked twice
+  sch.index({ restaurant: 1, status: 1, eventAt: -1 });
+  sch.index({ restaurant: 1, branch: 1, eventAt: -1 });
+  sch.index({ commissionReturnDue: 1, commissionReturnedAt: 1 });
+  return sch;
+})());
+
+// Slot capacity for scheduled orders. count is only changed with atomic conditional updates.
+export const SlotBooking = mongoose.model('SlotBooking', (() => {
+  const sch = new Schema({ restaurant: oid('Restaurant', { required: true }), branch: oid('Branch', { default: null }), slotStart: { type: Date, required: true }, count: { type: Number, default: 0 } });
+  sch.index({ restaurant: 1, branch: 1, slotStart: 1 }, { unique: true });
+  return sch;
+})());
