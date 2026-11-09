@@ -17,6 +17,9 @@ import { subscriptionRouter, webhookRouter } from './routes/subscription.js';
 import publicPayRoutes from './routes/publicPay.js';
 import paystackConnect from './routes/paystackConnect.js';
 import uploadRoutes from './routes/uploads.js';
+import earningsRoutes from './routes/earnings.js';
+import branchRoutes from './routes/branches.js';
+import staffRoutes from './routes/staff.js';
 import platformRoutes from './routes/platformPublic.js';
 import pushRoutes from './routes/push.js';
 import inboxRoutes, { publicContact } from './routes/inbox.js';
@@ -28,6 +31,8 @@ import { retryFailedEmails } from './services/email.js';
 import { getPlanConfig } from './services/settings.js';
 import { isAllowedCustomOrigin, runDomainWorker, migrateLegacyDomains } from './services/customDomain.js';
 import { platformHosts } from './services/domainUtils.js';
+import { runSchedulingJobs } from './services/scheduling.js';
+import { backfillLedger } from './services/ledger.js';
 
 for (const k of ['MONGODB_URI', 'JWT_SECRET', 'CLIENT_URL']) if (!process.env[k]) { console.error(`Missing env ${k}`); process.exit(1); }
 
@@ -70,6 +75,9 @@ const limiter = (max, windowMs = 15 * 60 * 1000) => rateLimit({ windowMs, max, s
 app.use('/api/auth/login', limiter(20));
 app.use('/api/auth/register', limiter(10));
 app.use('/api/auth/forgot-password', limiter(5));
+app.use('/api/auth/accept-invite', limiter(20));
+app.use('/api/auth/invite', limiter(60));
+app.use('/api/staff/invite', limiter(30, 60 * 60 * 1000));
 app.use('/api/public', limiter(300));
 app.use('/api/public/r/:slug/checkout', limiter(30));
 app.use('/api/public/r/:slug/places', limiter(120));
@@ -92,6 +100,9 @@ app.use('/api/restaurant/payments/paystack', paystackConnect);
 app.use('/api/restaurant', restaurantRoutes);
 app.use('/api/menu', menuRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/earnings', earningsRoutes);
+app.use('/api/branches', branchRoutes);
+app.use('/api/staff', staffRoutes);
 app.use('/api/subscription', subscriptionRouter);
 app.use('/api/public', platformRoutes);
 app.use('/api/public', publicContact);
@@ -129,6 +140,10 @@ cron.schedule('*/5 * * * *', () => retryFailedEmails().catch((e) => console.erro
 // Custom-domain verification: every minute, but each domain is only touched when ITS next check is due (30s -> 2h back-off), in small batches.
 cron.schedule('* * * * *', () => runDomainWorker().catch((e) => console.error('[domains]', e)));
 migrateLegacyDomains().catch((e) => console.error('[domains] legacy migration', e));
+// Scheduled orders: give back slots of unpaid online orders and remind restaurants shortly before each scheduled order is due.
+cron.schedule('* * * * *', () => runSchedulingJobs().catch((e) => console.error('[scheduling]', e)));
+// One-time: put already-completed orders into the new earnings ledger at 0% commission (idempotent).
+backfillLedger().catch((e) => console.error('[ledger] backfill', e));
 
 cron.schedule('*/5 * * * *', () => reconcilePayments().catch((e) => console.error('[reconcile]', e)));
 
