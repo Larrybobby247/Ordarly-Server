@@ -4,7 +4,7 @@ import { z, validate, wrap, normalisePhone, validWhatsapp, slugify } from '../ut
 import { requireAuth, loadRestaurant, requirePro } from '../middleware/auth.js';
 import { clearCacheOnWrite } from '../services/publicCache.js';
 import { RESERVED_SLUGS, NIGERIAN_STATES } from '../config/plans.js';
-import { restaurantUrl } from '../services/customDomain.js';
+import { platformDomain } from '../services/customDomain.js';
 import { branchFilter, canBranch } from '../services/access.js';
 import { DEFAULT_SCHEDULING, schedulingOf } from '../services/schedule.js';
 import { validTz } from '../services/tz.js';
@@ -45,7 +45,7 @@ r.get('/', wrap(async (req, res) => {
   res.json({
     restaurant: rest, ...common, access, branches, subscription: req.subscription,
     plan: { maxActiveMeals: req.isPro ? null : cfg.free.maxActiveMeals, proPrice: cfg.pro.priceNgn, commissionPct: cfg[req.plan]?.commissionPct ?? 0, maxBranches: req.isBusiness ? cfg.business.maxBranches : 0 },
-    publicUrl: restaurantUrl(rest, { customDomainActive }),
+    publicUrl: (customDomainActive && rest.customDomain) ? `https://${rest.customDomain}` : `https://${rest.slug}.${platformDomain()}`, // dashboard always shows the <slug>.<platform> address
   });
 }));
 
