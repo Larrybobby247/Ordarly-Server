@@ -2,7 +2,6 @@ import { Router } from 'express';
 import multer from 'multer';
 import { Order, OrderPayment, PaymentProof, Restaurant, Subscription } from '../models/index.js';
 import { wrap, sha256, naira } from '../utils/helpers.js';
-import { isProActive } from '../services/subscription.js';
 import { startOrderPayment, verifyOrderPayment } from '../services/orderPayments.js';
 import { sniffImage, saveProof } from '../services/storage.js';
 import { sendEmail, btn } from '../services/email.js';
@@ -21,10 +20,8 @@ async function orderByToken(token) {
 r.post('/track/:token/pay', wrap(async (req, res) => {
   const order = await orderByToken(req.params.token);
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  const [rest, sub] = await Promise.all([Restaurant.findById(order.restaurant), Subscription.findOne({ restaurant: order.restaurant })]);
+  const rest = await Restaurant.findById(order.restaurant); // online payment works on every plan; commission (Free) is already fixed on the order
   if (!rest || rest.status !== 'active') return res.status(409).json({ error: 'Restaurant unavailable' });
-  if (!isProActive(sub))
-    return res.status(409).json({ error: 'Online payment is not available for this restaurant right now.' });
   try {
     const out = await startOrderPayment(order, rest, `${await publicBaseFor(req, rest, true)}/track/${req.params.token}?pay=1`);
     res.json(out);

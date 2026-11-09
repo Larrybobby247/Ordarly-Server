@@ -8,7 +8,8 @@ import {
 import { z, validate, wrap, sha256, randomToken, escapeHtml } from '../utils/helpers.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { getPlanConfig, setPlanConfig, getPlatformSettings, setPlatformSettings } from '../services/settings.js';
-import { adminGrantPro, adminRevokePro } from '../services/subscription.js';
+import { adminGrantPro, adminRevokePro, planOf } from '../services/subscription.js';
+import { LedgerEntry, Branch } from '../models/index.js';
 import { sendEmail, btn, retryEmailById } from '../services/email.js';
 import { ps } from '../services/paystack.js';
 import { menuRouter } from './menu.js';
@@ -256,7 +257,7 @@ async function adminTenant(req, res, next) {
     const rest = await Restaurant.findById(req.params.id);
     if (!rest) return res.status(404).json({ error: 'Restaurant not found' });
     const sub = await Subscription.findOne({ restaurant: rest._id });
-    req.restaurant = rest; req.subscription = sub; req.isPro = isProActive(sub); req.planConfig = await getPlanConfig();
+    req.restaurant = rest; req.subscription = sub; req.isPro = isProActive(sub); req.plan = planOf(sub); req.planConfig = await getPlanConfig();
     next();
   } catch (e) { next(e); }
 }
@@ -265,7 +266,7 @@ const auditMenuWrites = (req, res, next) => {
   next();
 };
 r.get('/restaurants/:id/menu-info', adminTenant, wrap(async (req, res) => {
-  res.json({ restaurant: { _id: req.restaurant._id, name: req.restaurant.name, slug: req.restaurant.slug, plan: req.isPro ? 'pro' : 'free', status: req.restaurant.status } });
+  res.json({ restaurant: { _id: req.restaurant._id, name: req.restaurant.name, slug: req.restaurant.slug, plan: req.plan, status: req.restaurant.status } });
 }));
 r.use('/restaurants/:id/menu', adminTenant, clearCacheOnWrite, auditMenuWrites, menuRouter());
 
@@ -284,13 +285,13 @@ r.post('/restaurants/:id/reactivate', wrap(async (req, res) => {
 
 // Manual comp / revoke of Pro (support goodwill, billing fixes). No payment record is created and it is audited.
 r.post('/restaurants/:id/plan', validate(z.object({
-  action: z.enum(['grant_pro', 'revoke_pro']), days: z.number().int().min(1).max(365).optional(), reason: z.string().min(3).max(300),
+  action: z.enum(['grant_pro', 'grant_business', 'revoke_pro']), days: z.number().int().min(1).max(365).optional(), reason: z.string().min(3).max(300),
 })), wrap(async (req, res) => {
   const rest = await Restaurant.findById(req.params.id);
   if (!rest) return res.status(404).json({ error: 'Not found' });
-  if (req.body.action === 'grant_pro') {
+  if (req.body.action === 'grant_pro' || req.body.action === 'grant_business') {
     if (!req.body.days) return res.status(400).json({ error: 'Choose how many days to grant.' });
-    await adminGrantPro(rest._id, req.body.days);
+    await adminGrantPro(rest._id, req.body.days, req.body.action === 'grant_business' ? 'business' : 'pro');
   } else await adminRevokePro(rest._id);
   await audit(req, req.body.action, rest._id, { days: req.body.days, reason: req.body.reason });
   res.json({ subscription: await Subscription.findOne({ restaurant: rest._id }).lean() });
@@ -419,7 +420,7 @@ r.get('/analytics', wrap(async (req, res) => {
   const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
   const since = new Date(Date.now() - days * 86400000);
   const day = (field) => ({ $dateToString: { format: '%Y-%m-%d', date: field, timezone: 'Africa/Lagos' } });
-  const [signups, orders, revenue, plans, subStatus, byChannel, byFulfillment, top, withMeals, withOrders, restaurants, trialsStarted, paidAfterTrial] = await Promise.all([
+  const [signups, orders, revenue, plans, subStatus, byChannel, byFulfillment, top, withMeals, withOrders, restaurants, paidSubscribers] = await Promise.all([
     User.aggregate([{ $match: { role: 'owner', createdAt: { $gte: since } } }, { $group: { _id: day('$createdAt'), n: { $sum: 1 } } }]),
     Order.aggregate([{ $match: { createdAt: { $gte: since } } }, { $group: { _id: day('$createdAt'), n: { $sum: 1 } } }]),
     SubscriptionPayment.aggregate([{ $match: { status: 'success', createdAt: { $gte: since } } }, { $group: { _id: day('$createdAt'), n: { $sum: 1 }, v: { $sum: '$amount' } } }]),
@@ -434,8 +435,7 @@ r.get('/analytics', wrap(async (req, res) => {
       { $project: { n: 1, v: 1, name: { $first: '$r.name' }, slug: { $first: '$r.slug' } } },
     ]),
     Meal.distinct('restaurant'), Order.distinct('restaurant'), Restaurant.countDocuments(),
-    Subscription.countDocuments({ trialUsed: true }),
-    Subscription.countDocuments({ trialUsed: true, status: 'active', lastPaymentReference: /^SUB-/ }),
+    Subscription.countDocuments({ status: 'active', lastPaymentReference: /^(SUB-|ADMIN-GRANT)/ }),
   ]);
   const rev = fillDays(days, revenue);
   res.json({
@@ -455,8 +455,7 @@ r.get('/analytics', wrap(async (req, res) => {
       { label: 'Restaurants registered', value: restaurants },
       { label: 'Added at least one meal', value: withMeals.length },
       { label: 'Received at least one order', value: withOrders.length },
-      { label: 'Started a Pro trial', value: trialsStarted },
-      { label: 'Paid for Pro after a trial', value: paidAfterTrial },
+      { label: 'Subscribed to a paid plan', value: paidSubscribers },
     ],
   });
 }));
@@ -520,13 +519,67 @@ r.put('/settings', validate(z.object({
 }));
 
 r.get('/plans', wrap(async (req, res) => res.json(await getPlanConfig())));
+const pct = z.number().min(0).max(50);
 r.put('/plans', validate(z.object({
-  free: z.object({ maxActiveMeals: z.number().int().min(1).max(1000) }).optional(),
-  pro: z.object({ priceNgn: z.number().min(100).max(10_000_000), trialDays: z.number().int().min(0).max(90) }).optional(),
+  free: z.object({ maxActiveMeals: z.number().int().min(1).max(1000).nullable(), commissionPct: pct }).partial().optional(),
+  pro: z.object({ priceNgn: z.number().min(100).max(10_000_000), commissionPct: pct, yearlyDiscountPct: pct }).partial().optional(),
+  business: z.object({ enabled: z.boolean(), priceNgn: z.number().min(0).max(10_000_000), maxBranches: z.number().int().min(0).max(500), commissionPct: pct, yearlyDiscountPct: pct }).partial().optional(),
 })), wrap(async (req, res) => {
+  // The Business plan can only be switched on once an admin has actually chosen its price and branch limit (nothing is hard-coded).
+  const cur = await getPlanConfig();
+  const nb = { ...cur.business, ...(req.body.business || {}) };
+  if (nb.enabled && !(nb.priceNgn > 0 && nb.maxBranches > 0)) return res.status(400).json({ error: 'Set a price and a branch limit above zero before turning the Business plan on.' });
   const next = await setPlanConfig(req.body);
   await audit(req, 'update_plans', 'plans', req.body);
   res.json(next);
+}));
+
+/* ================= Revenue, commission and plan overview ================= */
+r.get('/revenue', wrap(async (req, res) => {
+  const now = new Date(), startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1), d30 = new Date(+now - 30 * 86400000), in24 = new Date(+now + 86400000);
+  const subRev = (m = {}) => SubscriptionPayment.aggregate([{ $match: { status: 'success', ...m } }, { $group: { _id: { $ifNull: ['$plan', 'pro'] }, v: { $sum: '$amount' }, n: { $sum: 1 } } }]);
+  const comm = (m = {}) => LedgerEntry.aggregate([{ $match: { status: 'earned', ...m } }, { $group: { _id: null, commission: { $sum: '$commission' }, orders: { $sum: 1 }, meals: { $sum: '$mealSubtotal' } } }]);
+  const [byPlan, active30, subAll, subMonth, commAll, commMonth, held, owed, completed, completedMonth, firstPays, expired30, upcoming, next24, scheduledAll, scheduledByStatus] = await Promise.all([
+    Restaurant.aggregate([{ $group: { _id: '$plan', n: { $sum: 1 } } }]),
+    Order.distinct('restaurant', { createdAt: { $gte: d30 } }),
+    subRev(), subRev({ createdAt: { $gte: startOfMonth } }),
+    comm(), comm({ eventAt: { $gte: startOfMonth } }),
+    LedgerEntry.aggregate([{ $match: { status: 'held' } }, { $group: { _id: null, commission: { $sum: '$commission' }, orders: { $sum: 1 } } }]),
+    LedgerEntry.aggregate([{ $match: { commissionReturnDue: { $gt: 0 }, commissionReturnedAt: null } }, { $group: { _id: null, due: { $sum: '$commissionReturnDue' }, n: { $sum: 1 } } }]),
+    Order.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, n: { $sum: 1 }, v: { $sum: '$total' } } }]),
+    Order.aggregate([{ $match: { status: 'completed', updatedAt: { $gte: startOfMonth } } }, { $group: { _id: null, n: { $sum: 1 }, v: { $sum: '$total' } } }]),
+    SubscriptionPayment.aggregate([{ $match: { status: 'success' } }, { $group: { _id: '$restaurant', first: { $min: '$createdAt' } } }, { $match: { first: { $gte: d30 } } }, { $count: 'n' }]),
+    Subscription.countDocuments({ status: 'expired', updatedAt: { $gte: d30 } }),
+    Order.countDocuments({ isScheduled: true, status: { $nin: ['completed', 'cancelled'] }, scheduledFor: { $gte: now } }),
+    Order.countDocuments({ isScheduled: true, status: { $nin: ['completed', 'cancelled'] }, scheduledFor: { $gte: now, $lt: in24 } }),
+    Order.countDocuments({ isScheduled: true }),
+    Order.aggregate([{ $match: { isScheduled: true } }, { $group: { _id: '$status', n: { $sum: 1 } } }]),
+  ]);
+  const rev = (rows, k) => rows.find((x) => x._id === k)?.v || 0;
+  res.json({
+    restaurantsByPlan: Object.fromEntries(['free', 'pro', 'business'].map((k) => [k, byPlan.find((x) => x._id === k)?.n || 0])),
+    activeRestaurants30d: active30.length,
+    subscriptionRevenue: { pro: { total: rev(subAll, 'pro'), month: rev(subMonth, 'pro') }, business: { total: rev(subAll, 'business'), month: rev(subMonth, 'business') } },
+    commission: { total: commAll[0]?.commission || 0, month: commMonth[0]?.commission || 0, orders: commAll[0]?.orders || 0, pending: held[0]?.commission || 0, pendingOrders: held[0]?.orders || 0, toReturn: owed[0]?.due || 0, toReturnCount: owed[0]?.n || 0 },
+    completedOrders: { count: completed[0]?.n || 0, value: completed[0]?.v || 0, monthCount: completedMonth[0]?.n || 0, monthValue: completedMonth[0]?.v || 0 },
+    upgrades30d: firstPays[0]?.n || 0, cancellations30d: expired30,
+    scheduled: { upcoming, next24h: next24, total: scheduledAll, byStatus: Object.fromEntries(scheduledByStatus.map((x) => [x._id, x.n])) },
+  });
+}));
+
+// Commission that Ordarly received at payment time for orders that were then cancelled / refunded, so it is owed back to the restaurant.
+r.get('/commission-returns', wrap(async (req, res) => {
+  const rows = await LedgerEntry.find({ commissionReturnDue: { $gt: 0 }, commissionReturnedAt: null }).sort('-reversedAt').limit(100).lean();
+  const rests = await Restaurant.find({ _id: { $in: rows.map((x) => x.restaurant) } }).select('name slug').lean();
+  const name = new Map(rests.map((x) => [String(x._id), x]));
+  res.json({ rows: rows.map((e) => ({ id: e._id, orderRef: e.orderRef, restaurant: name.get(String(e.restaurant))?.name, slug: name.get(String(e.restaurant))?.slug, due: e.commissionReturnDue, at: e.reversedAt || e.updatedAt })) });
+}));
+r.post('/ledger/:id/returned', validate(z.object({ note: z.string().max(200).optional() })), wrap(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Not found' });
+  const e = await LedgerEntry.findOneAndUpdate({ _id: req.params.id, commissionReturnDue: { $gt: 0 }, commissionReturnedAt: null }, { commissionReturnedAt: new Date() }, { new: true });
+  if (!e) return res.status(404).json({ error: 'Nothing to mark' });
+  await audit(req, 'commission_returned', e.restaurant, { order: e.orderRef, amount: e.commissionReturnDue, note: req.body.note });
+  res.json({ ok: true });
 }));
 
 export default r;

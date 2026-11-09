@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { Category, Meal } from '../models/index.js';
 import { z, validate, wrap } from '../utils/helpers.js';
-import { requireAuth, loadRestaurant } from '../middleware/auth.js';
+import { requireAuth, loadRestaurant, requirePerm, requireAllBranches } from '../middleware/auth.js';
 import { clearCacheOnWrite } from '../services/publicCache.js';
 
 // The menu routes only ever use req.restaurant (+ req.isPro / req.planConfig). They are mounted twice:
@@ -127,7 +127,7 @@ return r;
 
 // Owner version: authenticated, scoped to the caller's own restaurant.
 const owner = Router();
-owner.use(requireAuth, loadRestaurant);
+owner.use(requireAuth, loadRestaurant, requirePerm('menu'), requireAllBranches);
 owner.use(clearCacheOnWrite); // PERF: owner edits clear the public-page cache so customers see changes immediately
 owner.use(menuRouter());
 export default owner;

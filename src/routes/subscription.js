@@ -36,7 +36,16 @@ subscriptionRouter.use(requireAuth, loadRestaurant);
 subscriptionRouter.get('/', wrap(async (req, res) => {
   const payments = await SubscriptionPayment.find({ restaurant: req.restaurant._id }).sort('-createdAt').limit(20).lean();
   const cfg = await getPlanConfig();
-  res.json({ subscription: req.subscription, isPro: req.isPro, price: cfg.pro.priceNgn, yearly: yearlyQuote(cfg), payments });
+  const biz = cfg.business;
+  const bizOpen = !!(biz.enabled && biz.priceNgn > 0 && biz.maxBranches > 0); // closed until an admin sets a price and a branch limit
+  res.json({
+    subscription: req.subscription, isPro: req.isPro, plan: req.plan, price: cfg.pro.priceNgn, yearly: yearlyQuote(cfg), payments,
+    plans: {
+      free: { commissionPct: cfg.free.commissionPct },
+      pro: { price: cfg.pro.priceNgn, yearly: yearlyQuote(cfg, 'pro'), commissionPct: cfg.pro.commissionPct },
+      business: { open: bizOpen, price: biz.priceNgn, yearly: bizOpen ? yearlyQuote(cfg, 'business') : null, commissionPct: biz.commissionPct, maxBranches: biz.maxBranches },
+    },
+  });
 }));
 
 subscriptionRouter.post('/checkout', wrap(async (req, res) => {
@@ -49,14 +58,18 @@ subscriptionRouter.post('/checkout', wrap(async (req, res) => {
   const reference = 'SUB-' + randomToken(10);
   // The client only says WHICH plan; the amount and length of access are decided here, never taken from the browser.
   const interval = req.body?.interval === 'yearly' ? 'yearly' : 'monthly';
-  const yearly = yearlyQuote(cfg);
-  const amount = interval === 'yearly' ? yearly.price : cfg.pro.priceNgn;
-  const periodDays = interval === 'yearly' ? yearly.periodDays : cfg.pro.periodDays;
+  const plan = req.body?.plan === 'business' ? 'business' : 'pro';
+  if (!req.access?.isOwner) return res.status(403).json({ error: 'Only the account owner can manage the subscription.' });
+  if (plan === 'business' && !(cfg.business.enabled && cfg.business.priceNgn > 0 && cfg.business.maxBranches > 0)) return res.status(409).json({ error: 'The Business plan is not open for sign-up yet. Please contact Ordarly.' });
+  if (plan === 'pro' && req.plan === 'business') return res.status(409).json({ error: 'You are on the Business plan, which already includes everything in Pro.' });
+  const yearly = yearlyQuote(cfg, plan);
+  const amount = interval === 'yearly' ? yearly.price : cfg[plan].priceNgn;
+  const periodDays = interval === 'yearly' ? yearly.periodDays : cfg[plan].periodDays;
   const payment = await SubscriptionPayment.create({
     restaurant: req.restaurant._id,
     subscription: sub._id,
     providerReference: reference,
-    amount, interval, periodDays,
+    amount, interval, periodDays, plan,
   });
 
   const data = await ps('/transaction/initialize', {
@@ -69,6 +82,7 @@ subscriptionRouter.post('/checkout', wrap(async (req, res) => {
       callback_url: `${process.env.CLIENT_URL}/dashboard/subscription?ref=${reference}`,
       metadata: {
         purpose: 'pro_subscription',
+        plan,
         interval,
         restaurantId: String(req.restaurant._id),
       },

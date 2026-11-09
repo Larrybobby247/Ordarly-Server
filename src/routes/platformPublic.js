@@ -13,7 +13,14 @@ r.get('/platform', wrap(async (req, res) => {
   res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300'); // PERF (new): public, rarely-changing settings
   const [s, plans] = await Promise.all([getPlatformSettings(), getPlanConfig()]);
   res.json({
-    pricing: { proPriceNgn: plans.pro.priceNgn, yearlyPriceNgn: yearlyQuote(plans).price, yearlyDiscountPct: yearlyQuote(plans).discountPct, trialDays: plans.pro.trialDays, freeMeals: plans.free.maxActiveMeals },
+    pricing: {
+      freeCommissionPct: plans.free.commissionPct, proCommissionPct: plans.pro.commissionPct,
+      proPriceNgn: plans.pro.priceNgn, yearlyPriceNgn: yearlyQuote(plans).price, yearlyDiscountPct: yearlyQuote(plans).discountPct, freeMeals: plans.free.maxActiveMeals,
+      // Business is shown with its price only once an admin has configured and enabled it; otherwise the card says "Contact us".
+      business: plans.business.enabled && plans.business.priceNgn > 0 && plans.business.maxBranches > 0
+        ? { open: true, priceNgn: plans.business.priceNgn, maxBranches: plans.business.maxBranches, commissionPct: plans.business.commissionPct, yearlyPriceNgn: yearlyQuote(plans, 'business').price }
+        : { open: false },
+    },
     supportEmail: s.supportEmail,
     registrationOpen: s.registrationOpen,
     announcement: s.announcement.enabled && s.announcement.text ? s.announcement : { enabled: false },

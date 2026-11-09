@@ -7,7 +7,7 @@ import { clearCacheOnWrite } from '../services/publicCache.js';
 import { ps, listNigerianBanks, resolveAccount, PaystackError } from '../services/paystack.js';
 
 const r = Router();
-r.use(requireAuth, loadRestaurant, requirePro('Online payments'));
+r.use(requireAuth, loadRestaurant); // online payment setup is open to every plan (Free pays commission on completed orders)
 r.use(clearCacheOnWrite); // PERF: payment-setting changes clear the public-page cache
 
 /**

@@ -1,10 +1,11 @@
 import { placeDetails } from '../services/places.js';
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import { User, Restaurant } from '../models/index.js';
+import { User, Restaurant, StaffMember } from '../models/index.js';
+import { buildAccess, OWNER_ACCESS } from '../services/access.js';
 import { z, validate, wrap, sha256, randomToken, slugify, normalisePhone } from '../utils/helpers.js';
 import { RESERVED_SLUGS, NIGERIAN_STATES } from '../config/plans.js';
-import { signSession, setSessionCookie, requireAuth, COOKIE } from '../middleware/auth.js';
+import { signSession, setSessionCookie, requireAuth, optionalUser, COOKIE } from '../middleware/auth.js';
 import { ensureSubscription } from '../services/subscription.js';
 import { sendEmail, btn } from '../services/email.js';
 import { getPlatformSettings } from '../services/settings.js';
@@ -108,8 +109,49 @@ r.post('/reset-password', validate(z.object({ token: z.string(), password: z.str
 }));
 
 r.get('/me', requireAuth, wrap(async (req, res) => {
-  const rest = await Restaurant.findOne({ owner: req.user._id }).select('name slug plan status');
-  res.json({ user: { name: req.user.name, email: req.user.email, role: req.user.role }, restaurant: rest });
+  let rest = await Restaurant.findOne({ owner: req.user._id }).select('name slug plan status');
+  let access = OWNER_ACCESS;
+  if (!rest && req.user.role === 'staff') { // invited staff work inside the restaurant that invited them
+    const staff = await StaffMember.findOne({ user: req.user._id, status: 'active' });
+    if (staff) { rest = await Restaurant.findById(staff.restaurant).select('name slug plan status'); access = buildAccess(staff); }
+  }
+  res.json({ user: { name: req.user.name, email: req.user.email, role: req.user.role }, restaurant: rest,
+    access: { isOwner: access.isOwner, role: access.role, allBranches: access.allBranches, branchIds: access.branchIds, perms: [...access.perms] } });
+}));
+
+/* ---------- Staff invitations ---------- */
+const findInvite = async (token) => {
+  const m = token ? await StaffMember.findOne({ tokenHash: sha256(String(token)), status: 'invited', expiresAt: { $gt: new Date() } }) : null;
+  return m;
+};
+
+// What the invitation page shows before the person signs in or creates a password.
+r.get('/invite/:token', wrap(async (req, res) => {
+  const m = await findInvite(req.params.token);
+  if (!m) return res.status(404).json({ error: 'This invitation is invalid or has expired. Ask the owner to send a new one.' });
+  const rest = await Restaurant.findById(m.restaurant).select('name');
+  res.json({ restaurant: rest?.name, email: m.email, role: m.role, hasAccount: !!(await User.exists({ email: m.email })) });
+}));
+
+// Accept: a brand-new person sets a name and password (the invite link proves they own that email). An existing person
+// must already be signed in as the invited email. People who own a restaurant cannot also be staff elsewhere.
+r.post('/accept-invite', validate(z.object({ token: z.string().min(10).max(200), name: z.string().min(2).max(80).optional(), password: z.string().min(8).max(100).optional() })), wrap(async (req, res) => {
+  const m = await findInvite(req.body.token);
+  if (!m) return res.status(400).json({ error: 'This invitation is invalid or has expired. Ask the owner to send a new one.' });
+  let user = await User.findOne({ email: m.email });
+  if (user) {
+    const me = await optionalUser(req);
+    if (!me || String(me._id) !== String(user._id)) return res.status(401).json({ error: `Sign in as ${m.email} to accept this invitation.`, code: 'LOGIN_REQUIRED' });
+    if (user.role === 'admin' || (await Restaurant.exists({ owner: user._id }))) return res.status(409).json({ error: 'This account already runs its own restaurant. Use a different email address for staff access.' });
+    if (user.role !== 'staff') { user.role = 'staff'; await user.save(); }
+  } else {
+    if (!req.body.name || !req.body.password) return res.status(400).json({ error: 'Enter your name and choose a password.' });
+    user = await User.create({ name: req.body.name, email: m.email, passwordHash: await bcrypt.hash(req.body.password, 12), role: 'staff', emailVerified: true });
+  }
+  m.user = user._id; m.status = 'active'; m.acceptedAt = new Date(); m.tokenHash = undefined; await m.save();
+  user.lastLoginAt = new Date(); await user.save();
+  setSessionCookie(res, signSession(user));
+  res.json({ ok: true });
 }));
 
 export default r;
