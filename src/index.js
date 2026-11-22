@@ -83,6 +83,7 @@ app.use('/api/public/r/:slug/checkout', limiter(30));
 app.use('/api/public/r/:slug/places', limiter(120));
 app.use('/api/public/r/:slug/delivery-quote', limiter(60));
 app.use('/api/restaurant/places', limiter(60));
+app.use('/api/restaurant/delivery-test', limiter(40)); // each test makes a real Google + LocationIQ call
 app.use('/api/public/places', limiter(40));
 app.use('/api/public/track/:token/proof', limiter(10));
 app.use('/api/public/track/:token/pay', limiter(20));
