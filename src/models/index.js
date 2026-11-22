@@ -65,7 +65,7 @@ export const Restaurant = mongoose.model('Restaurant', new Schema({
     dineInEnabled: { type: Boolean, default: false },
     askTableNumber: { type: Boolean, default: false },
     // Radius delivery pricing: needs the restaurant's map location + the four numbers below.
-    location: { placeId: String, address: String, lat: Number, lng: Number },
+    location: { placeId: String, googlePlaceId: String, address: String, lat: Number, lng: Number },
     radius: {
       baseFee: { type: Number, default: 0 }, baseDistanceKm: { type: Number, default: 0 },
       perKmRate: { type: Number, default: 0 }, maxRadiusKm: { type: Number, default: 0 },
@@ -312,7 +312,7 @@ export const Branch = mongoose.model('Branch', new Schema({
   restaurant: oid('Restaurant', { required: true, index: true }),
   name: { type: String, required: true, trim: true, maxlength: 80 },
   address: { type: String, trim: true, maxlength: 300, default: '' },
-  location: { placeId: String, address: String, lat: Number, lng: Number },
+  location: { placeId: String, googlePlaceId: String, address: String, lat: Number, lng: Number },
   phone: { type: String, trim: true },
   whatsapp: String,
   openingHours: { type: [{ _id: false, day: Number, open: String, close: String, closed: Boolean }], default: [] }, // empty = use the restaurant's hours
