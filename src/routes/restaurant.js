@@ -9,7 +9,8 @@ import { branchFilter, canBranch } from '../services/access.js';
 import { DEFAULT_SCHEDULING, schedulingOf } from '../services/schedule.js';
 import { validTz } from '../services/tz.js';
 import mongoose from 'mongoose';
-import { autocomplete, placeDetails, placesConfigured } from '../services/places.js';
+import { autocomplete, placeDetails, toLocation } from '../services/places.js';
+import { DELIVERY_DEFAULTS, resolveRules, deliveryConfigured, quoteDelivery } from '../services/delivery.js';
 import { registerDomain, checkNow, disconnectDomain, domainView, DomainError } from '../services/customDomain.js';
 import { vercelConfigured } from '../services/vercel.js';
 
@@ -58,7 +59,7 @@ r.patch('/', validate(profileSchema), wrap(async (req, res) => {
   const { placeId, sessionToken } = b; delete b.placeId; delete b.sessionToken;
   Object.assign(req.restaurant, b); // schema whitelist: plan/status/owner cannot be set here
   if (placeId) { // an address picked from the suggestions also becomes the delivery start point
-    try { const p = await placeDetails(placeId, sessionToken); req.restaurant.fulfillment.location = { placeId: p.placeId, address: p.address, lat: p.lat, lng: p.lng }; } catch { /* keep the typed address */ }
+    try { const p = await placeDetails(placeId, sessionToken); req.restaurant.fulfillment.location = toLocation(p); } catch { /* keep the typed address */ }
   }
   await req.restaurant.save();
   res.json({ restaurant: req.restaurant });
@@ -106,36 +107,61 @@ r.delete('/custom-domain', domainRoute(async (req, res) => {
 }));
 
 /* ---------- Fulfillment & radius delivery pricing (all plans) ---------- */
-const deliveryReady = (f) => !!(f.radius?.configured && f.location?.lat != null);
+// Delivery only needs a saved restaurant location. Until the owner saves their own prices, the defaults (see services/delivery.js) apply.
+const deliveryReady = (f) => f.location?.lat != null;
 
 r.get('/fulfillment', wrap(async (req, res) => {
   const f = req.restaurant.fulfillment;
-  res.json({ fulfillment: f, deliveryReady: deliveryReady(f), mapsConfigured: placesConfigured() });
+  res.json({ fulfillment: f, deliveryReady: deliveryReady(f), mapsConfigured: deliveryConfigured(), rules: resolveRules(f.radius), defaults: DELIVERY_DEFAULTS });
 }));
 
-// Address search for the restaurant's own address (all plans). Goes through our server, so the LocationIQ key never reaches the browser.
-r.post('/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional() })), wrap(async (req, res) => {
-  res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken }) });
+// Address search for the restaurant's own address (all plans). Goes through our server, so the Google / LocationIQ keys never reach the browser.
+// `nearRestaurant` (used by the fee tester, which searches for CUSTOMER addresses) puts suggestions closest to the saved restaurant first.
+r.post('/places/autocomplete', validate(z.object({ input: z.string().min(3).max(120), sessionToken: z.string().max(64).optional(), nearRestaurant: z.boolean().optional() })), wrap(async (req, res) => {
+  const loc = req.body.nearRestaurant ? req.restaurant.fulfillment?.location : null;
+  const bias = loc?.lat != null ? { lat: loc.lat, lng: loc.lng, radiusM: resolveRules(req.restaurant.fulfillment.radius).maxRadiusKm * 1000 } : undefined;
+  res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken, bias }) });
 }));
 
 const radiusSchema = z.object({
   placeId: z.string().max(2000).optional(),
-  baseFee: z.number().min(0).max(100000), baseDistanceKm: z.number().min(0.5).max(50),
-  perKmRate: z.number().min(0).max(100000), maxRadiusKm: z.number().min(1).max(100),
+  baseFee: z.number().min(0).max(100000), perKmRate: z.number().min(0).max(100000), maxRadiusKm: z.number().min(1).max(100),
+  baseDistanceKm: z.number().min(0.5).max(50).optional(), // "advanced": left out = keep the saved value, or 3 km for a restaurant that has none yet
   sessionToken: z.string().max(64).optional(),
-}).refine((v) => v.maxRadiusKm >= v.baseDistanceKm, { message: 'Maximum radius must be at least the base distance.', path: ['maxRadiusKm'] });
+});
 
 r.put('/delivery-radius', validate(radiusSchema), wrap(async (req, res) => {
   const f = req.restaurant.fulfillment; const b = req.body;
   if (b.placeId) {
     const p = await placeDetails(b.placeId, b.sessionToken);
-    f.location = { placeId: p.placeId, address: p.address, lat: p.lat, lng: p.lng };
+    f.location = toLocation(p);
   }
   if (f.location?.lat == null) return res.status(400).json({ error: 'Search for and pick your restaurant\'s address first.' });
-  f.radius = { baseFee: b.baseFee, baseDistanceKm: b.baseDistanceKm, perKmRate: b.perKmRate, maxRadiusKm: b.maxRadiusKm, configured: true };
+  const baseDistanceKm = b.baseDistanceKm ?? resolveRules(f.radius).baseDistanceKm;
+  if (b.maxRadiusKm < baseDistanceKm) return res.status(400).json({ error: 'The maximum delivery radius must be at least as far as the distance your base fee covers.' });
+  f.radius = { baseFee: b.baseFee, baseDistanceKm, perKmRate: b.perKmRate, maxRadiusKm: b.maxRadiusKm, configured: true };
   req.restaurant.markModified('fulfillment');
-  await req.restaurant.save();
-  res.json({ fulfillment: req.restaurant.fulfillment, deliveryReady: true });
+  await req.restaurant.save(); // only affects NEW quotes and orders; existing orders keep the fee they were placed with
+  res.json({ fulfillment: req.restaurant.fulfillment, deliveryReady: true, rules: resolveRules(req.restaurant.fulfillment.radius) });
+}));
+
+// "Test your delivery charges": prices one customer address with the SAME quote function checkout uses. Nothing is saved.
+// The owner can test the values currently on screen (rules) and a restaurant address they have picked but not saved yet (restaurantPlaceId).
+r.post('/delivery-test', validate(z.object({
+  placeId: z.string().max(2000), sessionToken: z.string().max(64).optional(),
+  restaurantPlaceId: z.string().max(2000).optional(),
+  rules: z.object({ baseFee: z.number().min(0).max(100000), perKmRate: z.number().min(0).max(100000), maxRadiusKm: z.number().min(1).max(100), baseDistanceKm: z.number().min(0.5).max(50).optional() }).optional(),
+})), wrap(async (req, res) => {
+  const f = req.restaurant.fulfillment; const b = req.body;
+  if (!deliveryConfigured()) return res.status(503).json({ error: 'Address search or distance calculation is not set up on this platform yet.' });
+  const saved = resolveRules(f.radius);
+  const rules = b.rules ? { ...saved, ...b.rules, baseDistanceKm: b.rules.baseDistanceKm ?? saved.baseDistanceKm } : saved;
+  const origin = b.restaurantPlaceId ? await placeDetails(b.restaurantPlaceId) : f.location;
+  const q = await quoteDelivery({ fulfillment: f }, b.placeId, b.sessionToken, { rules, origin, tester: true });
+  res.json({
+    restaurantAddress: origin.address, customerAddress: q.place.address, distanceKm: q.distanceKm, durationMin: q.durationMin,
+    fee: q.ok ? q.fee : null, inCoverage: !!q.ok, maxRadiusKm: rules.maxRadiusKm,
+  });
 }));
 
 r.put('/fulfillment', validate(z.object({
@@ -143,7 +169,7 @@ r.put('/fulfillment', validate(z.object({
   dineInEnabled: z.boolean(), askTableNumber: z.boolean().optional(),
 })), wrap(async (req, res) => {
   if (req.body.deliveryEnabled && !deliveryReady(req.restaurant.fulfillment))
-    return res.status(400).json({ error: 'Set up your radius delivery rate first (your location, base fee, per-km rate and maximum radius), then turn delivery on.' });
+    return res.status(400).json({ error: 'Choose your restaurant location first, then turn delivery on.' });
   Object.assign(req.restaurant.fulfillment, req.body); await req.restaurant.save();
   res.json({ fulfillment: req.restaurant.fulfillment });
 }));

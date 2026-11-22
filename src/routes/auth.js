@@ -1,4 +1,4 @@
-import { placeDetails } from '../services/places.js';
+import { placeDetails, toLocation } from '../services/places.js';
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { User, Restaurant, StaffMember } from '../models/index.js';
@@ -45,7 +45,7 @@ r.post('/register', validate(registerSchema), wrap(async (req, res) => {
   });
   const slug = await uniqueSlug(b.slug || b.restaurantName);
   let location;
-  if (b.placeId) { try { const p = await placeDetails(b.placeId, b.sessionToken); location = { placeId: p.placeId, address: p.address, lat: p.lat, lng: p.lng }; } catch { /* typed address is still saved */ } }
+  if (b.placeId) { try { const p = await placeDetails(b.placeId, b.sessionToken); location = toLocation(p); } catch { /* typed address is still saved */ } }
   const rest = await Restaurant.create({
     owner: user._id, name: b.restaurantName, slug, phone: normalisePhone(b.phone),
     email: b.email, address: b.address, state: b.state, ...(location && { fulfillment: { location } }),

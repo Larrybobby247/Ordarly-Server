@@ -6,7 +6,7 @@ import { requireAuth, loadRestaurant, requirePerm, requireBusiness } from '../mi
 import { branchFilter, canBranch, scopedQuery } from '../services/access.js';
 import { clearCacheOnWrite } from '../services/publicCache.js';
 import { canAddBranch } from '../services/branches.js';
-import { autocomplete, placeDetails } from '../services/places.js';
+import { autocomplete, placeDetails, toLocation } from '../services/places.js';
 import { earningsSummary } from '../services/ledger.js';
 import { rangeBounds, tzOf } from '../services/tz.js';
 
@@ -37,7 +37,7 @@ async function applyBranchBody(branch, b) {
   if (plain.phone !== undefined) plain.phone = normalisePhone(plain.phone);
   if (plain.whatsapp !== undefined) plain.whatsapp = normalisePhone(plain.whatsapp);
   Object.assign(branch, plain);
-  if (placeId) { const p = await placeDetails(placeId, sessionToken); branch.location = { placeId: p.placeId, address: p.address, lat: p.lat, lng: p.lng }; if (!plain.address) branch.address = p.address; }
+  if (placeId) { const p = await placeDetails(placeId, sessionToken); branch.location = toLocation(p); if (!plain.address) branch.address = p.address; }
   if (fulfillment) {
     const { radius, ...flags } = fulfillment;
     Object.assign(branch.fulfillment, flags);

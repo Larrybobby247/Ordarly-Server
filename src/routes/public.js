@@ -2,7 +2,8 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import { Restaurant, Category, Meal, Order, PaymentConfig, Subscription, Branch } from '../models/index.js';
 import { z, validate, wrap, orderRef, randomToken, sha256, normalisePhone, naira } from '../utils/helpers.js';
-import { autocomplete, quoteDelivery, validPlaceId, placesConfigured } from '../services/places.js';
+import { autocomplete, validPlaceId } from '../services/places.js';
+import { quoteDelivery, resolveRules, deliveryConfigured } from '../services/delivery.js';
 import { planOf } from '../services/subscription.js';
 import { sendEmail, btn } from '../services/email.js';
 import { startOrderPayment } from '../services/orderPayments.js';
@@ -62,7 +63,7 @@ export function isOpenNow(rest, now = new Date()) {
   return mins >= oh * 60 + om && mins <= ch * 60 + cm;
 }
 
-const deliveryOn = (er) => !!(er.fulfillment?.deliveryEnabled && er.fulfillment.radius?.configured && er.fulfillment.location?.lat != null && placesConfigured());
+const deliveryOn = (er) => !!(er.fulfillment?.deliveryEnabled && er.fulfillment.location?.lat != null && deliveryConfigured());
 
 async function publicPayload(found, ctx) {
   const { rest, isPro, plan } = found;
@@ -117,7 +118,7 @@ async function publicPayload(found, ctx) {
         pickupInstructions: f.pickupInstructions,
         askTableNumber: rest.fulfillment.askTableNumber,
       },
-      deliveryRules: dOn ? { baseFee: f.radius.baseFee, baseDistanceKm: f.radius.baseDistanceKm, perKmRate: f.radius.perKmRate, maxRadiusKm: f.radius.maxRadiusKm } : null,
+      deliveryRules: dOn ? (({ baseFee, baseDistanceKm, perKmRate, maxRadiusKm }) => ({ baseFee, baseDistanceKm, perKmRate, maxRadiusKm }))(resolveRules(f.radius)) : null,
       payments,
       bank: payments.bankTransfer ? { bankName: cfg.bank.bankName, accountName: cfg.bank.accountName, accountNumber: cfg.bank.accountNumber } : null,
       scheduling: sch.enabled ? { enabled: true, maxDaysAhead: sch.maxDaysAhead, minNoticeMinutes: sch.minNoticeMinutes, slotMinutes: sch.slotMinutes, timezone: sch.timezone } : { enabled: false },
@@ -272,8 +273,8 @@ r.post('/r/:slug/places/autocomplete', validate(z.object({ input: z.string().min
   if (!found) return res.status(404).json({ error: 'Not found' });
   const ctx = await branchContext(found, req.body.branchId);
   const f = effectiveRestaurant(found.rest, ctx.branch).fulfillment;
-  if (!f?.radius?.configured || f.location?.lat == null) return res.json({ suggestions: [] });
-  res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken, bias: { lat: f.location.lat, lng: f.location.lng, radiusM: f.radius.maxRadiusKm * 1000 } }) });
+  if (f?.location?.lat == null) return res.json({ suggestions: [] });
+  res.json({ suggestions: await autocomplete(req.body.input, { sessionToken: req.body.sessionToken, bias: { lat: f.location.lat, lng: f.location.lng, radiusM: resolveRules(f.radius).maxRadiusKm * 1000 } }) });
 }));
 
 // Price check shown at checkout. The same calculation is repeated when the order is placed.
@@ -285,8 +286,9 @@ r.post('/r/:slug/delivery-quote', validate(quoteSchema), wrap(async (req, res) =
   const er = effectiveRestaurant(found.rest, ctx.branch);
   if (!er.fulfillment.deliveryEnabled) return res.status(404).json({ error: 'Delivery is not offered' });
   const q = await quoteDelivery(er, req.body.placeId, req.body.sessionToken);
-  if (!q.ok) return res.status(422).json({ error: `Sorry, that address is outside ${found.rest.name}${ctx.branch ? ' (' + ctx.branch.name + ')' : ''}'s delivery range (${er.fulfillment.radius.maxRadiusKm} km).`, distanceKm: q.distanceKm });
-  res.json({ fee: q.fee, distanceKm: q.distanceKm, address: q.place.address });
+  if (!q.ok) return res.status(422).json({ error: `Sorry, that address is outside ${found.rest.name}${ctx.branch ? ' (' + ctx.branch.name + ')' : ''}'s delivery range (${q.rules.maxRadiusKm} km), so delivery isn't available there. You can choose pickup instead.`, distanceKm: q.distanceKm });
+  // placeId is the resolved (signed, coordinates included) id, so placing the order needs no second address lookup.
+  res.json({ fee: q.fee, distanceKm: q.distanceKm, durationMin: q.durationMin, address: q.place.address, placeId: q.place.placeId });
 }));
 
 /* ---------- Scheduled orders: which days / times can be booked ---------- */
@@ -356,7 +358,7 @@ r.post('/r/:slug/checkout', validate(checkoutSchema), wrap(async (req, res) => {
     if (!er.fulfillment.deliveryEnabled) return res.status(400).json({ error: 'Delivery is not offered' });
     if (!validPlaceId(b.deliveryPlaceId)) return res.status(400).json({ error: 'Please search for your address and pick it from the list.' });
     const q = await quoteDelivery(er, b.deliveryPlaceId);
-    if (!q.ok) return res.status(400).json({ error: `Sorry, that address is outside our delivery range (${er.fulfillment.radius.maxRadiusKm} km). Please choose pickup instead.` });
+    if (!q.ok) return res.status(400).json({ error: `Sorry, that address is outside our delivery range (${q.rules.maxRadiusKm} km), so delivery isn't available there. Please choose pickup instead.` });
     deliveryFee = q.fee; deliveryPlace = q.place.address; deliveryDistanceKm = q.distanceKm; deliveryLocation = { lat: q.place.lat, lng: q.place.lng };
     if (!b.deliveryAddress || b.deliveryAddress.trim().length < 3) return res.status(400).json({ error: 'Please add your house name or number and any landmark' });
   } else if (b.fulfillment === 'pickup' && !er.fulfillment.pickupEnabled) return res.status(400).json({ error: 'Pickup is not offered' });

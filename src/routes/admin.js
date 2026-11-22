@@ -15,6 +15,8 @@ import { ps } from '../services/paystack.js';
 import { menuRouter } from './menu.js';
 import { clearCacheOnWrite } from '../services/publicCache.js';
 import { isProActive } from '../services/subscription.js';
+import { placesConfigured, googleConfigured } from '../services/places.js';
+import { routingConfigured } from '../services/routing.js';
 
 const r = Router();
 r.use(requireAuth, requireRole('admin'));
@@ -43,7 +45,7 @@ r.get('/system-check', wrap(async (req, res) => {
     webhookUrl: `https://${req.get('host')}/api/webhooks/paystack`,
     paystack, subaccounts,
     configured: {
-      jwtSecret: !!process.env.JWT_SECRET, email: !!process.env.RESEND_API_KEY, addressSearch: !!process.env.LOCATIONIQ_API_KEY,
+      jwtSecret: !!process.env.JWT_SECRET, email: !!process.env.RESEND_API_KEY, addressSearch: placesConfigured(), roadDistance: routingConfigured(), googlePlaces: googleConfigured(),
       pushNotifications: !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY),
     },
   });
