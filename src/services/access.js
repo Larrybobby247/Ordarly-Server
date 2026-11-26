@@ -47,6 +47,7 @@ export function canGrant(granter, { role, perms = [], branchIds = [], allBranche
 /** Routes a staff member may ever reach (default-deny for everything else). Owner-only areas are simply not listed. */
 export const STAFF_ROUTES = [
   { prefix: '/api/orders', perm: 'orders' },
+  { prefix: '/api/whatsapp/inbox', perm: 'orders' }, // the WhatsApp inbox only; every other WhatsApp route stays owner-only
   { prefix: '/api/menu', perm: 'menu' },
   { prefix: '/api/earnings', perm: 'analytics' },
   { prefix: '/api/branches', perm: null },          // per-handler checks (view vs manage)

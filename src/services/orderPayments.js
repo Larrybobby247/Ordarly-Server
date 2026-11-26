@@ -6,6 +6,7 @@ import { notifyRestaurant } from './notify.js';
 import { recordSale } from './ledger.js';
 import { formatLocal, tzOf } from './tz.js';
 import { commissionKobo } from './earningsMath.js';
+import { notifyOrderEvent } from './whatsappNotify.js';
 
 const audit = (order, by, field, from, to, note) => order.audit.push({ at: new Date(), by, field, from, to, note });
 const asString = (value) => (value === undefined || value === null ? '' : String(value));
@@ -227,8 +228,9 @@ export async function verifyOrderPayment(payment) {
       const when = order.isScheduled && order.scheduledFor ? formatLocal(order.scheduledFor, tzOf(rest)) : null;
       const where = order.branchName ? ` · ${order.branchName}` : '';
 
+      notifyOrderEvent(order, 'paid');
       await Promise.allSettled([
-        sendEmail({
+        order.source === 'whatsapp' ? null : sendEmail({
           to: order.customerEmail,
           type: 'payment_confirmed',
           restaurant: order.restaurant,
@@ -274,8 +276,9 @@ export async function verifyOrderPayment(payment) {
       audit(order, 'paystack', 'paymentStatus', 'pending', 'failed', t.status);
       order.paymentStatus = 'failed';
       await order.save();
+      notifyOrderEvent(order, 'payment_failed');
 
-      sendEmail({
+      if (order.source !== 'whatsapp') sendEmail({
         to: order.customerEmail,
         type: 'payment_failed',
         restaurant: order.restaurant,

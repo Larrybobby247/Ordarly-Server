@@ -150,3 +150,10 @@ export async function placeDetails(placeId, sessionToken) {
 
 /** The standard shape we store for a restaurant or branch location. */
 export const toLocation = (p) => ({ placeId: p.placeId, address: p.address, lat: p.lat, lng: p.lng, ...(p.googlePlaceId && { googlePlaceId: p.googlePlaceId }) });
+
+/** A location the customer shared on WhatsApp (a map pin) as the same signed place used everywhere else, so it needs no further lookup and cannot be edited. */
+export function signedPlaceFromCoords({ lat, lng, address }) {
+  if (!process.env.JWT_SECRET) throw fail('Address search is not set up yet.', 503);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw fail('That location is not usable.', 400);
+  return signPlace({ address: address || `Pinned location (${lat.toFixed(5)}, ${lng.toFixed(5)})`, lat, lng });
+}

@@ -21,7 +21,9 @@ export const STATUS_INFO = {
   connection_expired: { label: 'Connection expired', help: 'Your authorisation with Meta has expired. Reconnect WhatsApp to continue receiving messages.' },
 };
 
-export const isConnected = (integ) => integ?.connectionStatus === 'connected';
+export const isSuspended = (integ) => !!integ?.suspended?.at;
+/** Connected AND not suspended by the Ordarly administrator. A suspended number sends nothing and takes no new orders. */
+export const isConnected = (integ) => integ?.connectionStatus === 'connected' && !isSuspended(integ);
 
 /** What is really happening right now: a control is only ACTIVE when it is switched on AND the number is connected. */
 export function evaluate(integ) {
@@ -36,6 +38,7 @@ export function evaluate(integ) {
 
 const REASONS = {
   not_connected: 'WhatsApp is not connected.',
+  suspended: 'WhatsApp has been suspended for this restaurant by Ordarly.',
   automation_off: 'Automation is switched off.',
   stale_queue: 'This message was queued before automation was switched off, so it is cancelled.',
   predates_enable: 'The customer message arrived before automation was switched on, so it will not be answered automatically.',
@@ -52,7 +55,7 @@ const REASONS = {
 export function guardAutomatedSend(integ, { epoch, inboundAt } = {}) {
   const e = evaluate(integ);
   const no = (reason) => ({ ok: false, reason, message: REASONS[reason] });
-  if (!e.connected) return no('not_connected');
+  if (!e.connected) return no(isSuspended(integ) ? 'suspended' : 'not_connected');
   if (!e.automationEnabled) return no('automation_off');
   if (epoch !== undefined && epoch !== (integ.automationEpoch || 0)) return no('stale_queue');
   if (inboundAt && integ.automationEnabledAt && new Date(inboundAt) < new Date(integ.automationEnabledAt)) return no('predates_enable');
@@ -61,13 +64,15 @@ export function guardAutomatedSend(integ, { epoch, inboundAt } = {}) {
 
 /** A staff member replying from the Ordarly inbox is NOT automation: it only needs a live connection. */
 export function guardManualSend(integ) {
-  return isConnected(integ) ? { ok: true } : { ok: false, reason: 'not_connected', message: REASONS.not_connected };
+  if (isConnected(integ)) return { ok: true };
+  const reason = isSuspended(integ) ? 'suspended' : 'not_connected';
+  return { ok: false, reason, message: REASONS[reason] };
 }
 
 /** May a customer create a NEW order through WhatsApp? Existing orders are never affected by this. */
 export function guardOrderCreation(integ) {
   const e = evaluate(integ);
-  if (!e.connected) return { ok: false, reason: 'not_connected', message: REASONS.not_connected };
+  if (!e.connected) { const reason = isSuspended(integ) ? 'suspended' : 'not_connected'; return { ok: false, reason, message: REASONS[reason] }; }
   if (!e.acceptOrdersEnabled) return { ok: false, reason: 'orders_off', message: REASONS.orders_off };
   return { ok: true };
 }
