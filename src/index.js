@@ -22,6 +22,7 @@ import branchRoutes from './routes/branches.js';
 import staffRoutes from './routes/staff.js';
 import platformRoutes from './routes/platformPublic.js';
 import pushRoutes from './routes/push.js';
+import whatsappRoutes from './routes/whatsapp.js';
 import inboxRoutes, { publicContact } from './routes/inbox.js';
 import { reconcilePayments } from './services/reconcile.js';
 import { ErrorLog } from './models/index.js';
@@ -88,6 +89,7 @@ app.use('/api/public/places', limiter(40));
 app.use('/api/public/track/:token/proof', limiter(10));
 app.use('/api/public/track/:token/pay', limiter(20));
 app.use('/api/uploads', limiter(60));
+app.use('/api/whatsapp', limiter(120));
 // Custom domains: registering touches the Vercel API and DNS checks hit resolvers, so both are tightly limited per IP.
 app.use('/api/restaurant/custom-domain/verify', limiter(30, 10 * 60 * 1000));
 const domainWrites = limiter(12, 60 * 60 * 1000); // created ONCE so its counters persist between requests
@@ -109,6 +111,7 @@ app.use('/api/public', platformRoutes);
 app.use('/api/public', publicContact);
 app.use('/api/inbox', inboxRoutes);
 app.use('/api/push', pushRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/public', publicPayRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/uploads', uploadRoutes);
