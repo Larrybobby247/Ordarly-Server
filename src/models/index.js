@@ -262,6 +262,33 @@ export const AuditLog = mongoose.model('AuditLog', new Schema({
   actor: oid('User'), action: String, target: String, detail: Schema.Types.Mixed,
 }, { timestamps: true }));
 
+/* ---------- WhatsApp Commerce: connection + the three independent on/off controls (rules in services/whatsappControls.js) ---------- */
+const changeStamp = { _id: false, at: Date, by: oid('User'), byName: String };
+export const WhatsAppIntegration = mongoose.model('WhatsAppIntegration', new Schema({
+  restaurant: oid('Restaurant', { required: true, unique: true }), // one connection per restaurant; reconnecting reuses this row, so history stays attached
+  wabaId: String,
+  phoneNumberId: { type: String, index: { unique: true, sparse: true } }, // how an incoming webhook finds its restaurant
+  displayPhoneNumber: String, verifiedDisplayName: String,
+  encryptedAccessToken: { type: String, select: false }, // AES-256-GCM (services/tokenVault.js). Never returned by any API.
+  tokenExpiresAt: Date,
+  connectionStatus: { type: String, enum: ['not_connected', 'connecting', 'connected', 'verification_pending', 'action_required', 'disconnected', 'restricted', 'connection_expired'], default: 'not_connected' },
+  coexistenceEnabled: { type: Boolean, default: false },
+  // The two switches below default to OFF: nothing is sent or accepted until the restaurant turns it on.
+  automationEnabled: { type: Boolean, default: false },
+  acceptOrdersEnabled: { type: Boolean, default: false },
+  // Changes every time automation is switched on or off. Queued automated messages remember it, so ones queued before a switch-off are never sent later.
+  automationEpoch: { type: Number, default: 0 },
+  automationEnabledAt: Date, // customer messages older than this are never answered automatically
+  changes: { connection: changeStamp, automation: changeStamp, orders: changeStamp }, // who last changed each control, and when
+}, { timestamps: true }));
+
+export const WhatsAppControlLog = mongoose.model('WhatsAppControlLog', new Schema({
+  restaurant: oid('Restaurant', { required: true, index: true }),
+  control: { type: String, enum: ['connection', 'automation', 'orders'] },
+  from: String, to: String, by: oid('User'), byName: String,
+  note: String,
+}, { timestamps: true }));
+
 export const WebhookEvent = mongoose.model('WebhookEvent', new Schema({
   provider: String, eventId: { type: String, unique: true }, type: String,
 }, { timestamps: true }));
