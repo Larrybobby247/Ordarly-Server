@@ -23,6 +23,9 @@ import staffRoutes from './routes/staff.js';
 import platformRoutes from './routes/platformPublic.js';
 import pushRoutes from './routes/push.js';
 import whatsappRoutes from './routes/whatsapp.js';
+import whatsappWebhook from './routes/whatsappWebhook.js';
+import adminWhatsappRoutes from './routes/adminWhatsapp.js';
+import { runWhatsAppJobs, ensureDefaultPackages } from './services/whatsappJobs.js';
 import inboxRoutes, { publicContact } from './routes/inbox.js';
 import { reconcilePayments } from './services/reconcile.js';
 import { ErrorLog } from './models/index.js';
@@ -48,6 +51,7 @@ catch { console.warn('[perf] compression not installed (run npm install in serve
 
 // Webhooks need the raw body, so mount before express.json
 app.use('/api/webhooks', webhookRouter);
+app.use('/api/whatsapp/webhook', whatsappWebhook); // Meta's WhatsApp webhook (raw body, signature-verified)
 
 // CORS. Custom domains are served by the same frontend, so the browser calls this API from the restaurant's own domain.
 //  - Ordarly's own frontend origins: allowed for every route (cookies/auth unchanged).
@@ -81,11 +85,13 @@ app.use('/api/auth/invite', limiter(60));
 app.use('/api/staff/invite', limiter(30, 60 * 60 * 1000));
 app.use('/api/public', limiter(300));
 app.use('/api/public/r/:slug/checkout', limiter(30));
+app.use('/api/public/r/:slug/whatsapp-session', limiter(30));
 app.use('/api/public/r/:slug/places', limiter(120));
 app.use('/api/public/r/:slug/delivery-quote', limiter(60));
 app.use('/api/restaurant/places', limiter(60));
 app.use('/api/restaurant/delivery-test', limiter(40)); // each test makes a real Google + LocationIQ call
 app.use('/api/public/places', limiter(40));
+app.use('/api/public/track/:token', limiter(240)); // page polls every 15s; random tokens + this limit stop enumeration
 app.use('/api/public/track/:token/proof', limiter(10));
 app.use('/api/public/track/:token/pay', limiter(20));
 app.use('/api/uploads', limiter(60));
@@ -115,6 +121,7 @@ app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/public', publicPayRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/uploads', uploadRoutes);
+app.use('/api/admin/whatsapp', adminWhatsappRoutes);
 app.use('/api/admin', adminRoutes);
 
 let lastAlert = 0;
@@ -148,6 +155,10 @@ migrateLegacyDomains().catch((e) => console.error('[domains] legacy migration', 
 cron.schedule('* * * * *', () => runSchedulingJobs().catch((e) => console.error('[scheduling]', e)));
 // One-time: put already-completed orders into the new earnings ledger at 0% commission (idempotent).
 backfillLedger().catch((e) => console.error('[ledger] backfill', e));
+
+// WhatsApp: send queued messages, retry stored webhook events, settle/release credits (every minute).
+ensureDefaultPackages().catch((e) => console.error('[whatsapp] packages', e));
+cron.schedule('* * * * *', () => runWhatsAppJobs().catch((e) => console.error('[whatsapp jobs]', e)));
 
 cron.schedule('*/5 * * * *', () => reconcilePayments().catch((e) => console.error('[reconcile]', e)));
 
