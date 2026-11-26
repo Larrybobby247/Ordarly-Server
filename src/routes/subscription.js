@@ -1,6 +1,7 @@
 import { Router, raw } from 'express';
 import crypto from 'crypto';
-import { SubscriptionPayment, OrderPayment, WebhookEvent } from '../models/index.js';
+import { SubscriptionPayment, OrderPayment, WebhookEvent, WhatsAppCreditPurchase } from '../models/index.js';
+import { verifyPurchase } from '../services/whatsappCredits.js';
 import { verifyOrderPayment } from '../services/orderPayments.js';
 import { wrap, randomToken } from '../utils/helpers.js';
 import { requireAuth, loadRestaurant } from '../middleware/auth.js';
@@ -246,5 +247,11 @@ webhookRouter.post('/paystack', raw({ type: '*/*' }), wrap(async (req, res) => {
   if (event.event === 'charge.success' && ref?.startsWith('FOD-')) {
     const op = await OrderPayment.findOne({ providerReference: ref });
     if (op) await verifyOrderPayment(op);
+  }
+
+  // Ordarly message-credit top-ups: credits are added only after verify() has asked Paystack and matched amount, currency and restaurant.
+  if (event.event === 'charge.success' && ref?.startsWith('WAC-')) {
+    const cp = await WhatsAppCreditPurchase.findOne({ providerReference: ref });
+    if (cp) await verifyPurchase(cp);
   }
 }));

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
-import { Restaurant, Category, Meal, Order, PaymentConfig, Subscription, Branch } from '../models/index.js';
+import { Restaurant, Category, Meal, Order, PaymentConfig, Subscription, Branch, WhatsAppIntegration, CheckoutSession } from '../models/index.js';
 import { z, validate, wrap, orderRef, randomToken, sha256, normalisePhone, naira } from '../utils/helpers.js';
 import { autocomplete, validPlaceId } from '../services/places.js';
 import { quoteDelivery, resolveRules, deliveryConfigured } from '../services/delivery.js';
@@ -9,6 +9,7 @@ import { sendEmail, btn } from '../services/email.js';
 import { startOrderPayment } from '../services/orderPayments.js';
 import { notifyRestaurant } from '../services/notify.js';
 import { getCached, setCached } from '../services/publicCache.js';
+import { buildProgress } from '../services/orderProgress.js';
 import { SERVING, publicBaseFor, platformSubdomainSlug, platformDomain } from '../services/customDomain.js';
 import { cleanHostInput, isPlatformHost } from '../services/domainUtils.js';
 import { activeBranches, effectiveRestaurant, applyOverride, overrideMap } from '../services/branches.js';
@@ -21,7 +22,7 @@ import { tzOf, formatLocal, localDay, startOfLocalDay, addLocalDays, zonedToUtc 
 
 const r = Router();
 
-async function findRestaurant(key, byDomain = false) {
+export async function findRestaurant(key, byDomain = false) {
   // Hostname lookups only ever match a domain that is ACTIVE (or a legacy-verified one awaiting re-check); unverified claims never resolve.
   // <slug>.<platform domain> is a subdomain of Ordarly itself, so it resolves for every plan.
   const sub = byDomain ? platformSubdomainSlug(key) : null;
@@ -36,7 +37,7 @@ async function findRestaurant(key, byDomain = false) {
 }
 
 /** Which branch (if any) this request is about. Only the Business plan has branches; everyone else keeps the single-location flow. */
-async function branchContext(found, branchId) {
+export async function branchContext(found, branchId) {
   if (found.plan !== 'business') return { branches: [], branch: null, required: false };
   const branches = await activeBranches(found.rest._id);
   if (!branches.length) return { branches: [], branch: null, required: false };
@@ -83,6 +84,8 @@ async function publicPayload(found, ctx) {
     bankTransfer: isPro && !!(pay.bankTransferEnabled && cfg?.bank?.accountNumber),
     pod: isPro && !!pay.podEnabled,
   };
+  const waInt = await WhatsAppIntegration.findOne({ restaurant: rest._id }).select('connectionStatus automationEnabled acceptOrdersEnabled suspended displayPhoneNumber').lean();
+  const whatsappCommerce = !!(waInt && waInt.connectionStatus === 'connected' && !waInt.suspended?.at && waInt.automationEnabled && waInt.acceptOrdersEnabled && waInt.displayPhoneNumber);
   const sch = schedulingOf(rest);
   const branchCards = ctx.branches.map((b) => {
     const e = effectiveRestaurant(rest, b);
@@ -95,6 +98,7 @@ async function publicPayload(found, ctx) {
       accent: rest.theme?.accent, isOpen: isOpenNow(er), plan,
       whatsapp: er.whatsapp, prepTime: er.prepTimeMinutes ?? null,
     },
+    whatsappCommerce, // true = the website may offer "Continue on WhatsApp"
     branches: branchCards,
     branch: ctx.branch ? branchCards.find((b) => b._id === String(ctx.branch._id)) : null,
     branchRequired: !!ctx.required,
@@ -163,7 +167,7 @@ const cartSchema = z.array(z.object({
   mealId: z.string(), quantity: z.number().int().min(1).max(50), sizeId: z.string().max(40).optional(), addonIds: z.array(z.string()).max(20).optional(),
 })).min(1).max(60);
 
-async function priceCart(rest, cart, branchId) {
+export async function priceCart(rest, cart, branchId) {
   const ids = [...new Set(cart.map((c) => c.mealId))].filter((id) => mongoose.isValidObjectId(id));
   // PERF (changed): only the fields needed to price the cart, as plain objects (.lean()) instead of full Mongoose documents.
   const meals = await Meal.find({ _id: { $in: ids }, restaurant: rest._id }).select('name price available addons sizes').lean();
@@ -206,6 +210,24 @@ r.post('/r/:slug/validate-cart', validate(z.object({ cart: cartSchema, branchId:
   if (ctx.error) return res.status(400).json({ error: ctx.error, code: 'BRANCH_NOT_FOUND' });
   const { items, unavailable, subtotal, lines } = await priceCart(f.rest, req.body.cart, ctx.branch?._id);
   res.json({ items, unavailable, subtotal, lines });
+}));
+
+/* ---------- Continue on WhatsApp: hand the website cart to the restaurant's WhatsApp assistant ---------- */
+// Only a short-lived, single-use code is stored (hashed). The cart is re-priced from the database when the order is created, never taken from here.
+r.post('/r/:slug/whatsapp-session', validate(z.object({ cart: cartSchema, branchId: z.string().max(40).optional() })), wrap(async (req, res) => {
+  const f = await findRestaurant(req.params.slug);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  const ctx = await branchContext(f, req.body.branchId);
+  if (ctx.error || ctx.required) return res.status(400).json({ error: ctx.error || 'Please choose a branch first.', code: ctx.required ? 'BRANCH_REQUIRED' : 'BRANCH_NOT_FOUND' });
+  const integ = await WhatsAppIntegration.findOne({ restaurant: f.rest._id }).select('connectionStatus automationEnabled acceptOrdersEnabled suspended displayPhoneNumber').lean();
+  if (!(integ && integ.connectionStatus === 'connected' && !integ.suspended?.at && integ.automationEnabled && integ.acceptOrdersEnabled && integ.displayPhoneNumber))
+    return res.status(409).json({ error: 'WhatsApp ordering is not available right now.', code: 'WHATSAPP_OFF' });
+  const { unavailable } = await priceCart(f.rest, req.body.cart, ctx.branch?._id);
+  if (unavailable.length) return res.status(409).json({ error: 'Some items or options are no longer available. Please update your cart.', unavailable });
+  const token = 'ORD-' + randomToken(5).toUpperCase();
+  await CheckoutSession.create({ restaurant: f.rest._id, sessionTokenHash: sha256(token), items: req.body.cart.map((c) => ({ mealId: c.mealId, sizeId: c.sizeId, addonIds: c.addonIds || [], quantity: c.quantity })), branchId: ctx.branch ? String(ctx.branch._id) : undefined, expiry: new Date(Date.now() + 30 * 60000) });
+  const number = String(integ.displayPhoneNumber).replace(/\D/g, '');
+  res.json({ whatsappUrl: `https://wa.me/${number}?text=${encodeURIComponent(`Hi, I'd like to continue my order. ${token}`)}`, expiresInMinutes: 30 });
 }));
 
 /* ---------- FREE: WhatsApp order intent ---------- */
@@ -442,7 +464,8 @@ r.get('/track/:token', wrap(async (req, res) => {
   const rest = await Restaurant.findById(order.restaurant).lean();
   const branch = order.branch ? await Branch.findById(order.branch).select('name address').lean() : null;
   res.json({
-    reference: order.reference, restaurant: rest.name, restaurantSlug: rest.slug, branch: order.branchName || branch?.name || null,
+    reference: order.reference, restaurant: rest.name, restaurantSlug: rest.slug, restaurantLogo: rest.logo || null, restaurantPhone: rest.phone || null, restaurantWhatsapp: rest.whatsapp || null,
+    source: order.source === 'whatsapp' ? 'whatsapp' : 'website', progress: buildProgress(order), branch: order.branchName || branch?.name || null,
     items: order.items.map(({ name, size, quantity, price, addons }) => ({ name, size, quantity, price, addons })),
     subtotal: order.subtotal, deliveryFee: order.deliveryFee, total: order.total, fulfillment: order.fulfillment,
     pickupAddress: order.fulfillment === 'pickup' ? (branch?.address || rest.address) : undefined,

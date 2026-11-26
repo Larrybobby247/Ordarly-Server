@@ -10,6 +10,8 @@ import { releaseSlot } from '../services/scheduling.js';
 import { ORDER_TRANSITIONS, needsPaymentFirst, ACTIONABLE } from '../config/plans.js';
 import { sendEmail } from '../services/email.js';
 import { verifyOrderPayment } from '../services/orderPayments.js';
+import { notifyOrderEvent } from '../services/whatsappNotify.js';
+import { orderSourceFilter } from '../services/whatsappOrders.js';
 
 const r = Router();
 r.use(requireAuth, loadRestaurant, requirePerm('orders'));
@@ -32,6 +34,7 @@ r.get('/', wrap(async (req, res) => {
   else if (type === 'scheduled_done') { f.isScheduled = true; f.status = 'completed'; }
   if (status && type !== 'upcoming' && type !== 'scheduled_done') f.status = String(status);
   if (fulfillment) f.fulfillment = String(fulfillment);
+  if (req.query.source) Object.assign(f, orderSourceFilter(String(req.query.source))); // website | whatsapp
   if (paymentMethod) f.paymentMethod = String(paymentMethod);
   if (from || to) f.createdAt = { ...(from && { $gte: new Date(from) }), ...(to && { $lte: new Date(to) }) };
   if (q) { const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); f.$or = [{ reference: rx }, { customerName: rx }, { customerPhone: rx }]; }
@@ -77,7 +80,8 @@ r.patch('/:id/status', validate(z.object({ status: z.string() })), wrap(async (r
   // Money bookkeeping happens exactly once per order (unique ledger row): completing recognises the commission; cancelling reverses it and frees a booked slot.
   if (next === 'completed') await completeSale(o);
   if (next === 'cancelled') { await reverseSale(o); await releaseSlot(o); }
-  if (o.channel === 'checkout' && o.customerEmail)
+  notifyOrderEvent(o, next); // WhatsApp customers get the update on WhatsApp
+  if (o.channel === 'checkout' && o.customerEmail && o.source !== 'whatsapp')
     sendEmail({ to: o.customerEmail, type: 'order_status', restaurant: o.restaurant, order: o._id, dedupeKey: `status:${o._id}:${next}`,
       subject: `Order ${o.reference}: ${next.replace(/_/g, ' ')}`, body: `<p>Your order is now <b>${escapeHtml(next.replace(/_/g, ' '))}</b>.</p>` });
   res.json(o);
