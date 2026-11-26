@@ -145,8 +145,12 @@ const orderSchema = new Schema({
   restaurant: oid('Restaurant', { required: true, index: true }),
   reference: { type: String, required: true, unique: true },
   channel: { type: String, enum: ['whatsapp', 'checkout'], required: true },
+  // Where the order came from. Missing on older orders: treat as 'website' (or 'whatsapp' when channel is the old wa.me flow). See orderSourceFilter in services/whatsappOrders.js.
+  source: { type: String, enum: ['website', 'whatsapp'] },
   trackingTokenHash: { type: String, index: true, sparse: true },
+  trackingTokenEnc: { type: String, select: false }, // WhatsApp orders only: the token encrypted, so the tracking link can be re-sent. Lookups still use the hash.
   customerName: String, customerEmail: String, customerPhone: String,
+  waCustomerId: { type: String, index: true, sparse: true }, // WhatsApp orders: the verified WhatsApp identity that placed it (ownership check for "track my order")
   items: [itemSnap],
   subtotal: Number, deliveryFee: { type: Number, default: 0 }, total: Number,
   fulfillment: { type: String, enum: ['whatsapp_pickup', 'delivery', 'pickup', 'dine_in'] },
@@ -172,6 +176,7 @@ orderSchema.index({ restaurant: 1, createdAt: -1 });          // orders list, "t
 orderSchema.index({ restaurant: 1, status: 1, createdAt: -1 }); // filtered by status, new-order badge
 orderSchema.index({ restaurant: 1, paymentStatus: 1 });        // "proofs to review" counter
 orderSchema.index({ restaurant: 1, branch: 1, createdAt: -1 });   // branch dashboards
+orderSchema.index({ restaurant: 1, source: 1, createdAt: -1 });  // WhatsApp / website filter
 orderSchema.index({ isScheduled: 1, scheduledFor: 1 });          // reminders + upcoming list
 export const Order = mongoose.model('Order', orderSchema);
 
@@ -273,6 +278,28 @@ export const WhatsAppIntegration = mongoose.model('WhatsAppIntegration', new Sch
   tokenExpiresAt: Date,
   connectionStatus: { type: String, enum: ['not_connected', 'connecting', 'connected', 'verification_pending', 'action_required', 'disconnected', 'restricted', 'connection_expired'], default: 'not_connected' },
   coexistenceEnabled: { type: Boolean, default: false },
+  encryptedRegistrationPin: { type: String, select: false }, // two-step PIN set when a NEW number is registered (not needed for coexistence numbers)
+  lastWebhookReceivedAt: Date,
+  suspended: { _id: false, at: Date, by: oid('User'), reason: String }, // set by the Ordarly administrator; blocks every send and every new order
+  lastError: { _id: false, at: Date, code: String, message: String },
+  // Last known Meta account information. Only what Meta actually returned: nothing here is ever estimated.
+  meta: { _id: false, fetchedAt: Date, error: String, phone: Schema.Types.Mixed, waba: Schema.Types.Mixed, pricing: Schema.Types.Mixed },
+  templates: Schema.Types.Mixed, // { order_update: { name, status } }: message templates created on THIS restaurant's WhatsApp account
+  // Automation settings the restaurant controls. Anything that already exists in Ordarly (hours, delivery prices, address) is read from there, not copied here.
+  settings: {
+    _id: false,
+    welcomeMessage: { type: String, maxlength: 600 }, businessDescription: { type: String, maxlength: 600 },
+    outOfHoursMessage: { type: String, maxlength: 600 }, handoverMessage: { type: String, maxlength: 600 },
+    categoryIds: [{ type: Schema.Types.ObjectId }],            // empty = every category
+    allowDelivery: { type: Boolean, default: true }, allowPickup: { type: Boolean, default: true },
+    allowOnlinePayment: { type: Boolean, default: true }, allowPayOnDelivery: { type: Boolean, default: true },
+    confirmBeforeOrder: { type: Boolean, default: true },
+    handoverEnabled: { type: Boolean, default: true },
+    aiEnabled: { type: Boolean, default: false }, // the restaurant's own AI-assistance switch (off until the owner turns it on)
+    notifyStatuses: { type: [String], default: ['paid', 'accepted', 'preparing', 'ready', 'out_for_delivery', 'completed', 'cancelled'] },
+    staffNotify: { push: { type: Boolean, default: true }, email: { type: Boolean, default: true } },
+    abandonHours: { type: Number, default: 24, min: 1, max: 168 },
+  },
   // The two switches below default to OFF: nothing is sent or accepted until the restaurant turns it on.
   automationEnabled: { type: Boolean, default: false },
   acceptOrdersEnabled: { type: Boolean, default: false },
@@ -288,6 +315,188 @@ export const WhatsAppControlLog = mongoose.model('WhatsAppControlLog', new Schem
   from: String, to: String, by: oid('User'), byName: String,
   note: String,
 }, { timestamps: true }));
+
+/* ---------- WhatsApp Commerce: conversations, messages, Ordarly message credits ---------- */
+export const WhatsAppConversation = mongoose.model('WhatsAppConversation', (() => {
+  const s = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    customerWaId: { type: String, required: true }, // the customer's WhatsApp number, or 'bsuid:<id>' when Meta only gives a username-based id
+    customerPhone: String, customerName: String,
+    status: { type: String, enum: ['bot_active', 'human_pending', 'human_active', 'resolved'], default: 'bot_active' },
+    conversationState: { type: String, default: 'greeting' }, // the ordering step (see services/whatsappEngine.js)
+    flow: Schema.Types.Mixed, // small scratchpad for the current step (selected item, pending address choices, ...)
+    currentCart: [{ _id: false, mealId: String, sizeId: String, addonIds: [String], quantity: Number }],
+    cartVersion: { type: Number, default: 0 }, // changes with every cart edit; part of the "one order per cart" lock
+    orderLock: Number, // cartVersion an order was already started for (stops double orders from repeated taps or retries)
+    fulfillment: { type: String, enum: ['delivery', 'pickup'] },
+    delivery: { _id: false, placeId: String, address: String, details: String, distanceKm: Number, fee: Number, baseFee: Number },
+    branchId: String,
+    currentOrderId: oid('Order'),
+    confirmedName: String, contactPhone: String, phoneConfirmed: Boolean, // customer details collected in the chat (never taken from the WhatsApp profile name)
+    savedOffered: Boolean, aiStrikes: Number, lastAiAt: Date,
+    activeCheckoutSessionId: oid('CheckoutSession'),
+    humanTakeover: { type: Boolean, default: false },
+    assignedStaffId: oid('User'), assignedStaffName: String,
+    handoverReason: String, handoverAt: Date, handoverAckAt: Date,
+    greeted: { type: Boolean, default: false },
+    failedAttempts: { type: Number, default: 0 },
+    unreadCount: { type: Number, default: 0 },
+    lastMessagePreview: String, lastMessageDirection: String,
+    lastCustomerMessageAt: Date, lastOutboundMessageAt: Date, lastActivityAt: Date,
+    creditNoticeCycle: String, // wallet cycle in which the one "automated replies are paused" notice was sent
+    staffNotifiedAt: Date,
+  }, { timestamps: true });
+  s.index({ restaurant: 1, customerWaId: 1 }, { unique: true });          // one conversation per restaurant and customer
+  s.index({ restaurant: 1, status: 1, lastActivityAt: -1 });
+  s.index({ restaurant: 1, lastActivityAt: -1 });
+  return s;
+})());
+
+export const WhatsAppMessage = mongoose.model('WhatsAppMessage', (() => {
+  const s = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    conversation: oid('WhatsAppConversation', { required: true }),
+    customerWaId: String,
+    direction: { type: String, enum: ['inbound', 'outbound'], required: true },
+    messageType: String, // text | interactive | image | location | template | unsupported | ...
+    content: String,      // readable text shown in the inbox
+    payload: Schema.Types.Mixed, // outbound: what is sent to Meta. inbound: nothing sensitive (no raw webhook body)
+    metaMessageId: String,
+    origin: { type: String, enum: ['customer', 'bot', 'staff', 'business_app'] }, // business_app = typed on the restaurant's own WhatsApp Business App
+    sentByUser: oid('User'), sentByName: String,
+    automated: { type: Boolean, default: false },
+    // outbound queue
+    sendStatus: { type: String, enum: ['queued', 'sending', 'sent', 'failed', 'cancelled'] },
+    deliveryStatus: { type: String, enum: ['pending', 'sent', 'delivered', 'read', 'failed', 'unconfirmed'] },
+    attempts: { type: Number, default: 0 }, nextAttemptAt: Date, lockedAt: Date,
+    dedupeKey: String, // an outbound message with the same key is only ever queued once (e.g. "order status accepted for order X")
+    epoch: Number, inboundAt: Date, // see services/whatsappControls.js guardAutomatedSend
+    templateFallback: Schema.Types.Mixed, // used when the 24-hour customer window has closed
+    allowDuringHuman: { type: Boolean, default: false }, // the one handover acknowledgement may go out after the conversation is flagged
+    creditExempt: { type: Boolean, default: false }, exemptReason: String,
+    order: oid('Order', { index: true, sparse: true }), orderEvent: String, // set on order notifications (confirmation, status updates) so the dashboard can show them
+    messageCategory: { type: String, enum: ['service', 'utility', 'template'], default: 'service' },
+    failureCode: String, failureReason: String, failureKind: String,
+    creditReservationId: oid('WhatsAppMessageCreditReservation'),
+    creditCharged: { type: Boolean, default: false },
+    timestamp: { type: Date, default: Date.now },
+  }, { timestamps: true });
+  s.index({ metaMessageId: 1 }, { unique: true, sparse: true }); // Meta message ids are unique: this is also what makes inbound webhooks idempotent
+  s.index({ restaurant: 1, dedupeKey: 1 }, { unique: true, sparse: true });
+  s.index({ conversation: 1, timestamp: 1 });
+  s.index({ sendStatus: 1, nextAttemptAt: 1 });
+  s.index({ restaurant: 1, direction: 1, createdAt: -1 });
+  return s;
+})());
+
+// One row per Meta webhook item. The unique key makes a repeated (retried) delivery a no-op. Rows expire after 30 days.
+// ---- AI assistance (Groq). Completely separate from Ordarly message credits and from Meta billing. ----
+const aiEventSchema = new Schema({
+  restaurant: oid('Restaurant', { index: true }), conversation: oid('WhatsAppConversation'), provider: String, model: String,
+  status: { type: String, enum: ['ok', 'rate_limited', 'quota', 'timeout', 'network', 'auth', 'model', 'malformed', 'error', 'rejected'] },
+  inputTokens: { type: Number, default: 0 }, outputTokens: { type: Number, default: 0 }, latencyMs: Number, intent: String, fallback: Boolean,
+  createdAt: { type: Date, default: Date.now, index: { expires: 60 * 86400 } },
+}, { versionKey: false });
+export const AiUsageEvent = mongoose.model('AiUsageEvent', aiEventSchema);
+const aiDailySchema = new Schema({
+  day: { type: String, index: true }, restaurant: { type: Schema.Types.ObjectId, ref: 'Restaurant', default: null },
+  requests: { type: Number, default: 0 }, ok: { type: Number, default: 0 }, failed: { type: Number, default: 0 }, rateLimited: { type: Number, default: 0 },
+  fallbacks: { type: Number, default: 0 }, inputTokens: { type: Number, default: 0 }, outputTokens: { type: Number, default: 0 }, latencyMs: { type: Number, default: 0 },
+}, { versionKey: false });
+aiDailySchema.index({ day: 1, restaurant: 1 }, { unique: true }); // restaurant:null row = the global total for that day
+export const AiUsageDaily = mongoose.model('AiUsageDaily', aiDailySchema);
+export const AiProviderState = mongoose.model('AiProviderState', new Schema({
+  key: { type: String, unique: true }, state: { type: String, enum: ['closed', 'open'], default: 'closed' }, openUntil: Date, permanent: Boolean,
+  reason: String, consecutiveFailures: { type: Number, default: 0 }, lastSuccessAt: Date, lastError: { _id: false, at: Date, kind: String, message: String },
+}, { timestamps: true }));
+
+export const WhatsAppWebhookEvent = mongoose.model('WhatsAppWebhookEvent', (() => {
+  const s = new Schema({
+    key: { type: String, required: true, unique: true },
+    restaurant: oid('Restaurant'), phoneNumberId: String, wabaId: String, field: String,
+    payload: Schema.Types.Mixed,
+    processed: { type: Boolean, default: false }, attempts: { type: Number, default: 0 }, lastError: String, nextAttemptAt: Date,
+  }, { timestamps: true });
+  s.index({ processed: 1, nextAttemptAt: 1 });
+  s.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 86400 });
+  return s;
+})());
+
+// Ordarly's own message credits. NOT Meta billing: these two systems are never combined.
+export const OrdarlyCreditWallet = mongoose.model('OrdarlyCreditWallet', new Schema({
+  restaurant: oid('Restaurant', { required: true, unique: true }),
+  plan: String, cycleId: String,
+  monthlyAllowance: { type: Number, default: 0 }, monthlyUsed: { type: Number, default: 0 },
+  grantedThisCycle: { type: Number, default: 0 }, // highest allowance given in this cycle: switching plans back and forth can never earn more than the best plan's allowance
+  purchasedBalance: { type: Number, default: 0 },
+  purchasedGranted: { type: Number, default: 0 }, purchasedConsumed: { type: Number, default: 0 }, // running totals, used to work out which purchased pack is used first
+  reservedMonthly: { type: Number, default: 0 }, reservedPurchased: { type: Number, default: 0 },
+  billingCycleStart: Date, billingCycleEnd: Date, lastRenewedAt: Date,
+  warned: { _id: false, p25: String, p10: String, zero: String }, // cycle id each warning was last sent for (so it is sent once)
+}, { timestamps: true }));
+
+export const OrdarlyCreditTransaction = mongoose.model('OrdarlyCreditTransaction', (() => {
+  const s = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    transactionType: { type: String, enum: ['monthly_allocation', 'message_reservation', 'message_deduction', 'message_refund', 'topup_purchase', 'admin_adjustment', 'credit_expiry'], required: true },
+    amount: Number, // credits: positive adds, negative removes
+    pool: { type: String, enum: ['monthly', 'purchased'] },
+    source: String, reference: String, messageId: oid('WhatsAppMessage'), paymentReference: String, description: String,
+    previousBalance: Number, newBalance: Number, // total available credits before and after
+    status: { type: String, default: 'completed' },
+    expiresAt: Date, expiryProcessed: { type: Boolean, default: false }, // purchased packs only
+    adminId: oid('User'), adminName: String, reason: String,
+  }, { timestamps: true });
+  s.index({ reference: 1 }, { unique: true, sparse: true }); // makes monthly allocations, purchases and deductions idempotent
+  s.index({ restaurant: 1, createdAt: -1 });
+  return s;
+})());
+
+export const WhatsAppMessageCreditReservation = mongoose.model('WhatsAppMessageCreditReservation', (() => {
+  const s = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    messageId: oid('WhatsAppMessage', { required: true }),
+    reservedAmount: { type: Number, default: 1 },
+    pool: { type: String, enum: ['monthly', 'purchased'] },
+    finalStatus: { type: String, enum: ['reserved', 'settled', 'released'], default: 'reserved' },
+    releaseReason: String, transactionId: oid('OrdarlyCreditTransaction'),
+    reservedAt: { type: Date, default: Date.now }, settledAt: Date,
+  }, { timestamps: true });
+  s.index({ messageId: 1 }, { unique: true }); // one reservation per message: a message can never be charged twice
+  s.index({ finalStatus: 1, reservedAt: 1 });
+  return s;
+})());
+
+export const WhatsAppCreditPackage = mongoose.model('WhatsAppCreditPackage', new Schema({
+  name: { type: String, required: true }, credits: { type: Number, required: true, min: 1 },
+  price: { type: Number, default: 0, min: 0 }, // set by the Ordarly administrator: never defaulted to a made-up price
+  active: { type: Boolean, default: false },
+  expiryDays: { type: Number, default: null }, // null = purchased credits never expire. Shown to the restaurant before it buys.
+  sort: { type: Number, default: 0 },
+}, { timestamps: true }));
+
+export const WhatsAppCreditPurchase = mongoose.model('WhatsAppCreditPurchase', new Schema({
+  restaurant: oid('Restaurant', { required: true, index: true }),
+  package: oid('WhatsAppCreditPackage'), packageName: String, credits: Number, amount: Number, expiryDays: Number, // snapshot at purchase time
+  providerReference: { type: String, required: true, unique: true },
+  status: { type: String, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  verifiedAt: Date, raw: Schema.Types.Mixed,
+}, { timestamps: true }));
+
+// "Continue on WhatsApp": a website cart handed to WhatsApp. Only the HASH of the token is stored; rows expire on their own.
+export const CheckoutSession = mongoose.model('CheckoutSession', (() => {
+  const s = new Schema({
+    restaurant: oid('Restaurant', { required: true }),
+    sessionTokenHash: { type: String, required: true, unique: true },
+    customerWaId: String,
+    items: [{ _id: false, mealId: String, sizeId: String, addonIds: [String], quantity: Number }],
+    branchId: String, deliveryMethod: String,
+    expiry: { type: Date, required: true },
+    status: { type: String, enum: ['pending', 'claimed', 'expired'], default: 'pending' },
+  }, { timestamps: true });
+  s.index({ expiry: 1 }, { expireAfterSeconds: 3600 }); // removed an hour after it expires
+  return s;
+})());
 
 export const WebhookEvent = mongoose.model('WebhookEvent', new Schema({
   provider: String, eventId: { type: String, unique: true }, type: String,
